@@ -67,3 +67,17 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# ---------------------------------------------------------------------------
+# Ajustes propios del proyecto Screen-Saver
+# ---------------------------------------------------------------------------
+
+# La regla "Makefile" de la seccion de CMake tambien ocultaba NUESTRO Makefile,
+# que si debe versionarse. Esta excepcion lo vuelve a incluir.
+!Makefile
+
+# Binarios generados por make
+bin/
+
+# macOS
+.DS_Store

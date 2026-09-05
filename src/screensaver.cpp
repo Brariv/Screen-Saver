@@ -1,9 +1,41 @@
+// ============================================================================
+//  Screensaver Paralelo: Sistema Solar de Outer Wilds
+//  Universidad del Valle de Guatemala - Computacion Paralela y Distribuida
+//  Proyecto 1 - Entrega 2: Prueba de concepto
+//
+//  Integrantes: Javier Cifuentes (23079), Brandon Rivera (23088)
+//
+//  Alcance de esta entrega (prueba de concepto):
+//    1. Creacion de la ventana / area grafica donde correra el screensaver.
+//    2. Visualizacion de al menos un tipo de elemento de la propuesta:
+//       el Sol central (fijo, con pulso de brillo) y N cuerpos celestes que
+//       orbitan a su alrededor siguiendo trayectorias elipticas.
+//
+//  La estructura de datos (arreglo plano de CuerpoCeleste) y la separacion
+//  entre la fase de CALCULO y la fase de RENDERIZADO ya estan planteadas para
+//  la paralelizacion con OpenMP descrita en la propuesta:
+//      calcular en paralelo  ->  sincronizar  ->  renderizar en serie
+//
+//  Compilacion: ver Makefile / README.md
+// ============================================================================
 
-
+// ---------------------------------------------------------------------------
+// Cabeceras de la libreria grafica.
+// En macOS GLUT y OpenGL vienen como frameworks del sistema y sus rutas de
+// include son distintas a las de Linux, por eso la seleccion condicional.
+// ---------------------------------------------------------------------------
+#ifdef __APPLE__
 #include <GLUT/glut.h>
 #include <OpenGL/gl.h>
 #include <OpenGL/glu.h>
+#else
+#include <GL/freeglut.h>
+#include <GL/gl.h>
+#include <GL/glu.h>
+#endif
 
+// OpenMP solo se incluye cuando se compila el binario paralelo
+// (make paralelo -> -DUSE_OPENMP -fopenmp).
 #ifdef USE_OPENMP
 #include <omp.h>
 #endif
@@ -28,7 +60,7 @@ static const int   ANCHO_MAXIMO      = 7680;   // cota defensiva (8K)
 static const int   ALTO_MAXIMO       = 4320;
 static const long  N_MINIMO          = 1;      // al menos un cuerpo orbitando
 static const long  N_MAXIMO          = 2000000;// cota defensiva de memoria
-static const long  N_POR_DEFECTO     = 1;      // PoC: Sol + 1 cuerpo
+static const long  N_POR_DEFECTO     = 8;      // PoC: Sol + unos cuantos cuerpos
 static const int   ANCHO_POR_DEFECTO = 1024;
 static const int   ALTO_POR_DEFECTO  = 768;
 
@@ -41,6 +73,10 @@ static const float INTERVALO_FPS     = 0.5f;   // ventana de promedio de FPS
 //  ESTRUCTURAS DE DATOS
 // ============================================================================
 
+// Un cuerpo celeste que orbita al Sol. Cada instancia es INDEPENDIENTE de las
+// demas: su nuevo estado depende unicamente de sus propios campos y del dt.
+// Esa independencia es justamente lo que permitira repartir el arreglo entre
+// varios hilos con #pragma omp parallel for sin condiciones de carrera.
 struct CuerpoCeleste {
     float semiEjeMayor;     // radio horizontal de la orbita (pixeles)
     float semiEjeMenor;     // radio vertical de la orbita (pixeles)
@@ -51,6 +87,8 @@ struct CuerpoCeleste {
     float colorR, colorG, colorB; // color pseudoaleatorio del cuerpo
 };
 
+// Estado global de la escena. GLUT trabaja con callbacks sin parametros de
+// usuario, por lo que el estado debe ser accesible globalmente.
 struct EstadoEscena {
     std::vector<CuerpoCeleste> cuerpos; // los N cuerpos que orbitan
     int   anchoVentana;
@@ -79,7 +117,8 @@ static std::chrono::steady_clock::time_point g_marcaTiempoPrevia;
 //  ARGUMENTOS DE LINEA DE COMANDOS (programacion defensiva)
 // ============================================================================
 
-
+// Imprime el modo de uso del programa. Se llama ante cualquier argumento
+// invalido para que el usuario sepa como corregirlo.
 static void imprimirUso(const char* nombrePrograma) {
     std::fprintf(stderr,
         "\nUso: %s [N] [ancho] [alto] [semilla]\n"
@@ -148,6 +187,11 @@ static bool leerEnteroValidado(const char* texto, const char* nombreParametro,
 //  INICIALIZACION DE LA ESCENA
 // ============================================================================
 
+// Genera los N cuerpos con parametros orbitales pseudoaleatorios.
+// - Los radios de orbita se reparten entre un anillo interior y el borde de la
+//   ventana para que ningun cuerpo quede tapado por el Sol ni salga del canvas.
+// - La velocidad angular se deriva del radio imitando la tercera ley de Kepler
+//   (w es proporcional a r^-1.5): los cuerpos cercanos giran mas rapido.
 static void inicializarCuerpos(long cantidad, unsigned int semilla) {
     std::mt19937 generador(semilla);
     std::uniform_real_distribution<float> distUnitaria(0.0f, 1.0f);
@@ -165,6 +209,11 @@ static void inicializarCuerpos(long cantidad, unsigned int semilla) {
     for (long i = 0; i < cantidad; ++i) {
         CuerpoCeleste cuerpo;
 
+        // Radio orbital: muestreo estratificado. En lugar de un valor
+        // totalmente aleatorio, el rango disponible se divide en N franjas y
+        // cada cuerpo cae dentro de la suya con un pequeno desplazamiento
+        // aleatorio. Asi las orbitas quedan bien repartidas tanto para N=1
+        // como para N grande, sin que todos los cuerpos se amontonen.
         const float centroFranja = (static_cast<float>(i) + 0.5f) /
                                    static_cast<float>(cantidad);
         const float desplazamiento =
@@ -174,24 +223,36 @@ static void inicializarCuerpos(long cantidad, unsigned int semilla) {
         const float radioOrbital = radioOrbitaMinima +
             fraccion * (radioOrbitaMaxima - radioOrbitaMinima);
 
+        // Excentricidad suave: el semieje menor es entre 70% y 100% del mayor,
+        // lo que produce orbitas elipticas como la de The Interloper.
         const float achatamiento = 0.70f + 0.30f * distUnitaria(generador);
         cuerpo.semiEjeMayor = radioOrbital;
         cuerpo.semiEjeMenor = radioOrbital * achatamiento;
 
+        // Fase inicial aleatoria para que no arranquen todos alineados.
         cuerpo.anguloOrbital = distUnitaria(generador) * 2.0f * PI;
 
-        const float constanteGravitacional = 90000.0f;
+        // Tercera ley de Kepler (forma simplificada): w = k * r^(-3/2).
+        // La constante esta calibrada para que un cuerpo a media distancia
+        // complete una vuelta en ~30 s: un movimiento lento y contemplativo,
+        // acorde a un screensaver (y al ritmo pausado del juego).
+        // El signo alterna para que algunos cuerpos giren en sentido inverso.
+        const float constanteGravitacional = 600.0f;
         const float magnitudVelocidad =
             constanteGravitacional / std::pow(radioOrbital, 1.5f);
         const float sentido = (distUnitaria(generador) < 0.15f) ? -1.0f : 1.0f;
         cuerpo.velocidadAngular = sentido * magnitudVelocidad;
 
+        // Tamano del cuerpo: variacion pseudoaleatoria acotada para que ningun
+        // planeta resulte invisible ni tape a los demas.
         cuerpo.radioCuerpo = 6.0f + 12.0f * distUnitaria(generador);
 
+        // Color pseudoaleatorio con saturacion alta (se evita el gris apagado).
         cuerpo.colorR = 0.35f + 0.65f * distUnitaria(generador);
         cuerpo.colorG = 0.35f + 0.65f * distUnitaria(generador);
         cuerpo.colorB = 0.35f + 0.65f * distUnitaria(generador);
 
+        // Posicion inicial coherente con el angulo inicial.
         cuerpo.posX = g_escena.centroX +
                       cuerpo.semiEjeMayor * std::cos(cuerpo.anguloOrbital);
         cuerpo.posY = g_escena.centroY +
@@ -202,11 +263,17 @@ static void inicializarCuerpos(long cantidad, unsigned int semilla) {
 }
 
 // ============================================================================
-//  FASE DE CALCULO
+//  FASE DE CALCULO  (candidata a paralelizacion)
 // ============================================================================
 
+// Avanza la simulacion 'dt' segundos.
+// Cada iteracion del bucle escribe UNICAMENTE en cuerpos[i], por lo que el
+// bucle no tiene dependencias entre iteraciones y puede repartirse entre
+// hilos. En esta prueba de concepto el pragma ya esta colocado para verificar
+// que el toolchain de OpenMP funciona; la medicion formal de speedup queda
+// para la siguiente entrega.
 static void actualizarEscena(float dt) {
-    // --- Sol: pulso de brillo/tamano ---
+    // --- Sol: pulso de brillo/tamano (preludio del ciclo de supernova) ---
     g_escena.tiempoAcumulado += dt;
     g_escena.radioSolActual = g_escena.radioSolBase *
         (1.0f + 0.06f * std::sin(g_escena.tiempoAcumulado * 1.2f));
@@ -218,11 +285,19 @@ static void actualizarEscena(float dt) {
     const float centroY = g_escena.centroY;
 
 #ifdef USE_OPENMP
+    // schedule(static): todas las iteraciones cuestan practicamente lo mismo
+    // (dos llamadas trigonometricas), asi que un reparto en bloques iguales
+    // minimiza el overhead de planificacion.
+    // 'i' es privada por definicion; 'cuerpos', 'dt', 'centroX' y 'centroY'
+    // son compartidas pero de solo lectura, salvo cuerpos[i] que cada hilo
+    // escribe en exclusiva -> no hay condicion de carrera.
 #pragma omp parallel for schedule(static)
 #endif
     for (int i = 0; i < cantidad; ++i) {
         CuerpoCeleste& cuerpo = cuerpos[i];
 
+        // Integracion explicita del angulo (Euler) y normalizacion a [0, 2PI)
+        // para que el valor no crezca sin limite y pierda precision.
         cuerpo.anguloOrbital += cuerpo.velocidadAngular * dt;
         if (cuerpo.anguloOrbital >= 2.0f * PI) {
             cuerpo.anguloOrbital -= 2.0f * PI;
@@ -234,6 +309,9 @@ static void actualizarEscena(float dt) {
         cuerpo.posX = centroX + cuerpo.semiEjeMayor * std::cos(cuerpo.anguloOrbital);
         cuerpo.posY = centroY + cuerpo.semiEjeMenor * std::sin(cuerpo.anguloOrbital);
     }
+    // Salida de la region paralela: barrera implicita de OpenMP. A partir de
+    // aqui todas las posiciones estan actualizadas y el hilo principal puede
+    // dibujar con seguridad.
 }
 
 // ============================================================================
@@ -255,7 +333,8 @@ static void dibujarDisco(float centroX, float centroY, float radio,
     glEnd();
 }
 
-// Dibuja la elipse de la orbita como una linea tenue
+// Dibuja la elipse de la orbita como una linea tenue, para dar contexto
+// visual al movimiento (referencia del mapa del sistema solar).
 static void dibujarOrbita(const CuerpoCeleste& cuerpo) {
     glColor4f(1.0f, 1.0f, 1.0f, 0.10f);
     glBegin(GL_LINE_LOOP);
@@ -313,6 +392,7 @@ static void alDibujar() {
                      cuerpo.colorR, cuerpo.colorG, cuerpo.colorB, 1.0f);
     }
 
+    // HUD: FPS y cantidad de cuerpos (requisito del enunciado).
     char lineaHud[128];
     std::snprintf(lineaHud, sizeof(lineaHud), "FPS: %6.2f   |   N = %zu",
                   g_escena.fpsActual, g_escena.cuerpos.size());
@@ -326,6 +406,8 @@ static void alDibujar() {
 //  CALLBACKS DE GLUT
 // ============================================================================
 
+// Se invoca cuando la ventana cambia de tamano: reconstruye la proyeccion
+// ortografica para que 1 unidad del mundo equivalga a 1 pixel.
 static void alRedimensionar(int ancho, int alto) {
     if (ancho < 1) ancho = 1;
     if (alto  < 1) alto  = 1;
@@ -343,18 +425,22 @@ static void alRedimensionar(int ancho, int alto) {
     glLoadIdentity();
 }
 
-// Bucle de animacion
+// Bucle de animacion: mide el tiempo real transcurrido (dt), actualiza la
+// simulacion y solicita un nuevo cuadro. Usar dt real hace que la velocidad
+// del screensaver sea independiente de los FPS de la maquina.
 static void alEstarOcioso() {
     const std::chrono::steady_clock::time_point ahora =
         std::chrono::steady_clock::now();
     float dt = std::chrono::duration<float>(ahora - g_marcaTiempoPrevia).count();
     g_marcaTiempoPrevia = ahora;
 
+    // Proteccion contra saltos grandes (ventana minimizada, breakpoint, etc.)
     if (dt < 0.0f)       dt = 0.0f;
     if (dt > DT_MAXIMO)  dt = DT_MAXIMO;
 
     actualizarEscena(dt);
 
+    // Promedio de FPS sobre una ventana de tiempo fija, mas estable que 1/dt.
     g_escena.framesEnIntervalo += 1;
     g_escena.tiempoEnIntervalo += dt;
     if (g_escena.tiempoEnIntervalo >= INTERVALO_FPS) {
@@ -383,7 +469,9 @@ static void alPresionarTecla(unsigned char tecla, int x, int y) {
 // ============================================================================
 
 int main(int argc, char** argv) {
-
+    // --- Ayuda explicita ---
+    // Se atiende ANTES de glutInit para que el usuario pueda consultarla
+    // aunque no haya un servidor grafico disponible.
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-h") == 0 ||
             std::strcmp(argv[i], "--help") == 0) {
@@ -392,14 +480,18 @@ int main(int argc, char** argv) {
         }
     }
 
+    // GLUT consume sus propios argumentos (-display, -geometry, ...) y deja el
+    // resto en argv, por eso se inicializa antes de parsear los nuestros.
     glutInit(&argc, argv);
 
+    // --- Valores por defecto ---
     long cantidadCuerpos = N_POR_DEFECTO;
     long anchoSolicitado = ANCHO_POR_DEFECTO;
     long altoSolicitado  = ALTO_POR_DEFECTO;
     unsigned int semilla = static_cast<unsigned int>(
         std::chrono::steady_clock::now().time_since_epoch().count());
 
+    // --- Lectura defensiva de los argumentos ---
     if (argc > 5) {
         std::fprintf(stderr, "Error: demasiados argumentos (%d).\n", argc - 1);
         imprimirUso(argv[0]);
@@ -430,7 +522,7 @@ int main(int argc, char** argv) {
         semilla = static_cast<unsigned int>(semillaLeida);
     }
 
-    // --- Creacion de la ventana ---
+    // --- Creacion de la ventana / area grafica ---
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA);
     glutInitWindowSize(static_cast<int>(anchoSolicitado),
                        static_cast<int>(altoSolicitado));
@@ -478,5 +570,8 @@ int main(int argc, char** argv) {
     g_marcaTiempoPrevia = std::chrono::steady_clock::now();
     glutMainLoop();
 
+    // glutMainLoop no retorna en la implementacion de macOS; la liberacion de
+    // memoria queda a cargo del destructor de std::vector al terminar el
+    // proceso (no se usa memoria cruda, por lo que no hay fugas).
     return EXIT_SUCCESS;
 }

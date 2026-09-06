@@ -100,6 +100,17 @@ static const float CONSTANTE_GRAVITACIONAL = 600.0f;
 static const float TOLERANCIA_KEPLER       = 1.0e-6f;
 static const int   MAX_ITERACIONES_KEPLER  = 12;
 
+// --- Parametros de apariencia ---
+static const int    MAX_MANCHAS            = 4;    // detalles por superficie
+static const int    CANTIDAD_ESTRELLAS     = 260;  // estrellas de fondo
+static const float  DURACION_ESTELA        = 0.8f; // estela del salto cuantico
+static const int    RAYOS_CORONA           = 28;   // fulgores del Sol
+// Por encima de este N el dibujo se simplifica a disco + halo. El detalle fino
+// (manchas, anillos, zarcillos) solo tiene sentido cuando los cuerpos se ven
+// suficientemente grandes, y evita que el renderizado secuencial se vuelva el
+// cuello de botella en las pruebas de carga.
+static const size_t LIMITE_DETALLE_FINO    = 200;
+
 // ============================================================================
 //  TIPOS DE FISICA
 // ============================================================================
@@ -124,6 +135,25 @@ static const char* NOMBRES_FISICA[CANTIDAD_TIPOS_FISICA] = {
 // ============================================================================
 //  ESTRUCTURAS DE DATOS
 // ============================================================================
+
+// Detalle sobre la superficie de un cuerpo (continente, mar, crater, mancha
+// ciclonica...). Se guarda en coordenadas esfericas para que, al girar el
+// cuerpo sobre su eje, el detalle se desplace y desaparezca por el borde como
+// lo haria sobre una esfera real.
+struct ManchaSuperficie {
+    float longitud;  // posicion a lo largo del ecuador (rad)
+    float latitud;   // -PI/2 .. PI/2
+    float tamano;    // radio relativo al del cuerpo (0..1)
+};
+
+// Estrella del fondo. Se guarda en coordenadas normalizadas [0,1] para que
+// sobreviva a los cambios de tamano de la ventana.
+struct Estrella {
+    float x, y;        // posicion normalizada
+    float brillo;      // 0..1
+    float frecuencia;  // velocidad del parpadeo
+    float fase;        // desfase del parpadeo
+};
 
 // Un cuerpo celeste. Salvo el caso del satelite (que lee a su padre) y el de
 // los gemelos (que comparten el contador de arena), cada instancia se actualiza
@@ -162,6 +192,8 @@ struct CuerpoCeleste {
     float tiempoParaSalto;      // segundos restantes hasta el proximo salto
     float intervaloSalto;       // periodo entre saltos
     unsigned int contadorSaltos;// cuantos saltos lleva (entra al hash)
+    float posEstelaX, posEstelaY; // ultima posicion antes de saltar
+    float tiempoEstela;           // segundos que le quedan a la estela
 
     // --- FISICA_OSCILANTE ---
     int   armonicos;            // K terminos de la serie (costo del cuerpo)
@@ -174,6 +206,16 @@ struct CuerpoCeleste {
     float posX, posY;           // posicion resultante en coordenadas de ventana
     float colorR, colorG, colorB;
     int   hiloAsignado;         // id del hilo que lo actualizo (diagnostico)
+
+    // --- Apariencia ---
+    float anguloRotacion;       // rotacion propia sobre su eje (rad)
+    float velocidadRotacion;    // rad/s de la rotacion propia
+    int   cantidadManchas;
+    ManchaSuperficie manchas[MAX_MANCHAS];
+    float manchaR, manchaG, manchaB;  // color de los detalles de superficie
+    bool  tieneAnillo;
+    float inclinacionAnillo;    // achatamiento vertical del anillo (0.15-0.40)
+    int   indiceCompanero;      // gemelo binario asociado (-1 si no aplica)
 };
 
 // Estado global de la escena. GLUT trabaja con callbacks sin parametros de
@@ -188,6 +230,8 @@ struct EstadoEscena {
     std::vector<int> indicesSatelites;  // los que dependen de un padre
 
     int conteoPorTipo[CANTIDAD_TIPOS_FISICA];
+
+    std::vector<Estrella> estrellas;    // fondo estelar (coordenadas 0..1)
 
     // RECURSO COMPARTIDO entre los gemelos: cuanta arena se ha transferido.
     // Varios hilos lo modifican en el mismo cuadro -> se protege con atomic.
@@ -387,8 +431,18 @@ static void fisicaBinaria(CuerpoCeleste& c, float dt, float cx, float cy) {
 // ---------------------------------------------------------------------------
 static void fisicaCuantica(CuerpoCeleste& c, int indice, float dt,
                            float cx, float cy, float radioMaximo) {
+    if (c.tiempoEstela > 0.0f) {
+        c.tiempoEstela -= dt;
+        if (c.tiempoEstela < 0.0f) c.tiempoEstela = 0.0f;
+    }
+
     c.tiempoParaSalto -= dt;
     if (c.tiempoParaSalto <= 0.0f) {
+        // Deja una estela que se desvanece en el punto donde estaba: da la
+        // lectura visual de "desaparecio de aqui y aparecio alla".
+        c.posEstelaX  = c.posX;
+        c.posEstelaY  = c.posY;
+        c.tiempoEstela = DURACION_ESTELA;
         c.contadorSaltos += 1u;
         const unsigned int base =
             static_cast<unsigned int>(indice) * 2654435761u ^
@@ -516,6 +570,11 @@ static void actualizarEscena(float dt) {
             cuerpo.hiloAsignado = 0;
 #endif
 
+            // Rotacion propia sobre su eje: comun a todos los modelos y lo que
+            // hace que los detalles de superficie se desplacen por el disco.
+            cuerpo.anguloRotacion = normalizarAngulo(
+                cuerpo.anguloRotacion + cuerpo.velocidadRotacion * dt);
+
             switch (cuerpo.tipo) {
                 case FISICA_KEPLERIANA:
                     fisicaKepleriana(cuerpo, dt, cx, cy);
@@ -551,6 +610,8 @@ static void actualizarEscena(float dt) {
 #else
             cuerpo.hiloAsignado = 0;
 #endif
+            cuerpo.anguloRotacion = normalizarAngulo(
+                cuerpo.anguloRotacion + cuerpo.velocidadRotacion * dt);
             fisicaSatelite(cuerpo, cuerpos[cuerpo.indicePadre], dt);
         }
     }
@@ -577,6 +638,44 @@ static TipoFisica tipoParaIndice(long indice, long cantidad) {
     }
 }
 
+// Genera el fondo estelar. Las posiciones se guardan normalizadas para que la
+// escena siga siendo valida si el usuario redimensiona la ventana.
+static void inicializarEstrellas(unsigned int semilla) {
+    std::mt19937 generador(semilla);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+
+    g_escena.estrellas.clear();
+    g_escena.estrellas.reserve(CANTIDAD_ESTRELLAS);
+    for (int i = 0; i < CANTIDAD_ESTRELLAS; ++i) {
+        Estrella estrella;
+        estrella.x = dist(generador);
+        estrella.y = dist(generador);
+        // Distribucion sesgada hacia estrellas tenues: unas pocas destacan.
+        const float u = dist(generador);
+        estrella.brillo     = 0.18f + 0.72f * u * u;
+        estrella.frecuencia = 0.6f + 2.4f * dist(generador);
+        estrella.fase       = dist(generador) * 2.0f * PI;
+        g_escena.estrellas.push_back(estrella);
+    }
+}
+
+// Reparte unas cuantas manchas sobre la superficie de un cuerpo. Se colocan en
+// coordenadas esfericas (longitud, latitud) para que giren con el cuerpo.
+static void generarManchas(CuerpoCeleste& cuerpo, int cantidad,
+                           float tamanoMin, float tamanoMax,
+                           std::mt19937& generador) {
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    if (cantidad > MAX_MANCHAS) cantidad = MAX_MANCHAS;
+    cuerpo.cantidadManchas = cantidad;
+    for (int m = 0; m < cantidad; ++m) {
+        cuerpo.manchas[m].longitud = dist(generador) * 2.0f * PI;
+        // Se evitan los polos: ahi la mancha se veria deformada.
+        cuerpo.manchas[m].latitud  = (dist(generador) - 0.5f) * 1.4f;
+        cuerpo.manchas[m].tamano   = tamanoMin +
+            (tamanoMax - tamanoMin) * dist(generador);
+    }
+}
+
 // Genera los N cuerpos con sus parametros orbitales y su tipo de fisica.
 // - Los radios se reparten por muestreo estratificado para que las orbitas
 //   queden bien distribuidas tanto con N=1 como con N muy grande.
@@ -592,6 +691,13 @@ static void inicializarCuerpos(long cantidad, unsigned int semilla) {
                                       : g_escena.altoVentana);
     const float radioOrbitaMinima = g_escena.radioSolBase * 3.0f;
     const float radioOrbitaMaxima = radioMaximoDisponible * 0.92f;
+
+    // Con pocos cuerpos conviene dibujarlos mas grandes: se aprecian los
+    // detalles de superficie, los anillos y los zarcillos. Con N grande se
+    // reduce el tamano para que la escena no se convierta en una mancha.
+    const float escalaCuerpo = (cantidad <= 12) ? 1.75f
+                             : (cantidad <= 40) ? 1.30f
+                             : 1.00f;
 
     g_escena.cuerpos.clear();
     g_escena.cuerpos.reserve(static_cast<size_t>(cantidad));
@@ -626,13 +732,29 @@ static void inicializarCuerpos(long cantidad, unsigned int semilla) {
         const float sentido = (distUnitaria(generador) < 0.15f) ? -1.0f : 1.0f;
         cuerpo.velocidadAngular = sentido * magnitudVelocidad;
 
-        cuerpo.radioBase   = 6.0f + 12.0f * distUnitaria(generador);
+        cuerpo.radioBase   = (6.0f + 12.0f * distUnitaria(generador)) * escalaCuerpo;
         cuerpo.radioCuerpo = cuerpo.radioBase;
         cuerpo.colorR = 0.35f + 0.65f * distUnitaria(generador);
         cuerpo.colorG = 0.35f + 0.65f * distUnitaria(generador);
         cuerpo.colorB = 0.35f + 0.65f * distUnitaria(generador);
         cuerpo.indicePadre = -1;
+        cuerpo.indiceCompanero = -1;
         cuerpo.hiloAsignado = 0;
+
+        // --- Apariencia comun ---
+        // Rotacion propia: independiente de la orbital, con sentido y ritmo
+        // propios. Es la que arrastra los detalles de superficie.
+        cuerpo.velocidadRotacion = (distUnitaria(generador) < 0.2f ? -1.0f : 1.0f) *
+                                   (0.10f + 0.35f * distUnitaria(generador));
+        cuerpo.anguloRotacion = distUnitaria(generador) * 2.0f * PI;
+        // Los detalles se pintan en una version mas oscura y desaturada del
+        // color del cuerpo, para que se lean como relieve y no como manchas.
+        cuerpo.manchaR = cuerpo.colorR * 0.44f + 0.04f;
+        cuerpo.manchaG = cuerpo.colorG * 0.44f + 0.04f;
+        cuerpo.manchaB = cuerpo.colorB * 0.44f + 0.08f;
+        cuerpo.tieneAnillo = false;
+        cuerpo.inclinacionAnillo = 0.0f;
+        cuerpo.cantidadManchas = 0;
 
         // --- Parametros especificos de cada modelo de fisica ---
         switch (cuerpo.tipo) {
@@ -646,6 +768,15 @@ static void inicializarCuerpos(long cantidad, unsigned int semilla) {
                 cuerpo.tasaAnomaliaMedia = CONSTANTE_GRAVITACIONAL /
                     std::pow(cuerpo.semiEjeMayor, 1.5f);
                 cuerpo.iteracionesNewton = 0;
+                // Cometa de hielo: nucleo palido y azulado, y gira deprisa.
+                cuerpo.colorR = 0.72f;
+                cuerpo.colorG = 0.86f;
+                cuerpo.colorB = 0.98f;
+                cuerpo.manchaR = 0.50f;
+                cuerpo.manchaG = 0.66f;
+                cuerpo.manchaB = 0.85f;
+                cuerpo.velocidadRotacion *= 2.5f;
+                generarManchas(cuerpo, 2, 0.20f, 0.32f, generador);
                 break;
             }
             case FISICA_BINARIA: {
@@ -664,26 +795,46 @@ static void inicializarCuerpos(long cantidad, unsigned int semilla) {
                     cuerpo.desfaseLocal        = PI;   // gemelo opuesto
                     cuerpo.esDonanteDeArena    = false; // Ash: recibe
                     cuerpo.radioBase           = companero.radioBase;
+                    // Ash Twin: se va cubriendo de arena, tono claro y calido.
+                    cuerpo.colorR = 0.88f; cuerpo.colorG = 0.72f; cuerpo.colorB = 0.42f;
+                    cuerpo.manchaR = 0.68f; cuerpo.manchaG = 0.50f; cuerpo.manchaB = 0.28f;
+                    cuerpo.indiceCompanero = static_cast<int>(i) - 1;
+                    // Se cierra el enlace en los dos sentidos.
+                    g_escena.cuerpos[static_cast<size_t>(i - 1)].indiceCompanero =
+                        static_cast<int>(i);
+                    generarManchas(cuerpo, 3, 0.16f, 0.26f, generador);
                 } else {
                     cuerpo.radioBaricentro     = radioOrbital;
                     cuerpo.anguloBaricentro    = cuerpo.anguloOrbital;
                     cuerpo.velocidadBaricentro = cuerpo.velocidadAngular;
-                    cuerpo.radioLocal          = 16.0f + 10.0f * distUnitaria(generador);
+                    cuerpo.radioLocal          = (16.0f + 10.0f *
+                                                  distUnitaria(generador)) *
+                                                 escalaCuerpo;
                     cuerpo.velocidadLocal      = 5.0f * magnitudVelocidad;
                     cuerpo.anguloLocal         = distUnitaria(generador) * 2.0f * PI;
                     cuerpo.desfaseLocal        = 0.0f;
                     cuerpo.esDonanteDeArena    = true;  // Ember: cede
+                    // Ember Twin: roca volcanica oscura y rojiza.
+                    cuerpo.colorR = 0.76f; cuerpo.colorG = 0.36f; cuerpo.colorB = 0.26f;
+                    cuerpo.manchaR = 0.45f; cuerpo.manchaG = 0.16f; cuerpo.manchaB = 0.14f;
+                    generarManchas(cuerpo, 3, 0.18f, 0.30f, generador);
                 }
                 break;
             }
             case FISICA_SATELITE: {
                 cuerpo.indicePadre = static_cast<int>(i) - 1;
                 if (cuerpo.indicePadre < 0) cuerpo.indicePadre = 0;
-                cuerpo.radioBase   = 4.0f + 3.0f * distUnitaria(generador);
+                cuerpo.radioBase   = (4.0f + 3.0f * distUnitaria(generador)) *
+                                     escalaCuerpo;
                 cuerpo.radioCuerpo = cuerpo.radioBase;
-                cuerpo.radioLocal  = 26.0f + 14.0f * distUnitaria(generador);
+                cuerpo.radioLocal  = (26.0f + 14.0f * distUnitaria(generador)) *
+                                     escalaCuerpo;
                 // La luna gira bastante mas rapido que su planeta.
                 cuerpo.velocidadAngular = 8.0f * magnitudVelocidad;
+                // Luna rocosa gris con crateres bien marcados.
+                cuerpo.colorR = 0.66f; cuerpo.colorG = 0.64f; cuerpo.colorB = 0.62f;
+                cuerpo.manchaR = 0.42f; cuerpo.manchaG = 0.40f; cuerpo.manchaB = 0.40f;
+                generarManchas(cuerpo, 3, 0.20f, 0.34f, generador);
                 break;
             }
             case FISICA_CUANTICA: {
@@ -691,6 +842,11 @@ static void inicializarCuerpos(long cantidad, unsigned int semilla) {
                 cuerpo.tiempoParaSalto = cuerpo.intervaloSalto *
                                          distUnitaria(generador);
                 cuerpo.contadorSaltos  = 0u;
+                cuerpo.tiempoEstela    = 0.0f;
+                // Luna cuantica: turquesa palido, casi etereo.
+                cuerpo.colorR = 0.62f; cuerpo.colorG = 0.88f; cuerpo.colorB = 0.86f;
+                cuerpo.manchaR = 0.38f; cuerpo.manchaG = 0.62f; cuerpo.manchaB = 0.64f;
+                generarManchas(cuerpo, 2, 0.22f, 0.30f, generador);
                 break;
             }
             case FISICA_OSCILANTE: {
@@ -699,10 +855,22 @@ static void inicializarCuerpos(long cantidad, unsigned int semilla) {
                     24.0f * distUnitaria(generador));
                 cuerpo.amplitudOscilacion = 0.05f + 0.07f * distUnitaria(generador);
                 cuerpo.faseOscilacion     = distUnitaria(generador) * 2.0f * PI;
+                // Dark Bramble: verde oscuro y brumoso, con niebla interior.
+                cuerpo.colorR = 0.30f; cuerpo.colorG = 0.48f; cuerpo.colorB = 0.44f;
+                cuerpo.manchaR = 0.16f; cuerpo.manchaG = 0.30f; cuerpo.manchaB = 0.30f;
+                generarManchas(cuerpo, 3, 0.22f, 0.36f, generador);
                 break;
             }
             case FISICA_CIRCULAR:
             default:
+                // Planetas "normales": continentes y, en algunos, un anillo.
+                generarManchas(cuerpo, 2 + static_cast<int>(
+                                   2.0f * distUnitaria(generador)),
+                               0.18f, 0.34f, generador);
+                if (distUnitaria(generador) < 0.50f) {
+                    cuerpo.tieneAnillo = true;
+                    cuerpo.inclinacionAnillo = 0.16f + 0.22f * distUnitaria(generador);
+                }
                 break;
         }
 
@@ -721,6 +889,10 @@ static void inicializarCuerpos(long cantidad, unsigned int semilla) {
             g_escena.indicesPrimarios.push_back(static_cast<int>(i));
         }
     }
+
+    // El fondo estelar usa una semilla derivada para que no quede acoplado al
+    // sorteo de los cuerpos (cambiar N no reordena las estrellas).
+    inicializarEstrellas(semilla ^ 0x9E3779B9u);
 }
 
 // ============================================================================
@@ -754,6 +926,237 @@ static void dibujarContorno(float centroX, float centroY, float radio,
                    centroY + radio * std::sin(angulo));
     }
     glEnd();
+}
+
+// ---------------------------------------------------------------------------
+// Disco ILUMINADO: en vez de un circulo plano, el color de cada vertice del
+// borde se modula segun si esa parte del cuerpo mira o no hacia el Sol. El
+// resultado es un terminador (la linea dia/noche) que apunta siempre al centro
+// de la escena, igual que en un planeta real.
+// ---------------------------------------------------------------------------
+static void dibujarDiscoIluminado(float px, float py, float radio,
+                                  float r, float g, float b, float alfa) {
+    float dirSolX = g_escena.centroX - px;
+    float dirSolY = g_escena.centroY - py;
+    const float distancia = std::sqrt(dirSolX * dirSolX + dirSolY * dirSolY);
+    if (distancia > 1.0e-3f) {
+        dirSolX /= distancia;
+        dirSolY /= distancia;
+    } else {
+        dirSolX = 0.0f;
+        dirSolY = 1.0f;
+    }
+
+    glBegin(GL_TRIANGLE_FAN);
+    glColor4f(r * 0.80f, g * 0.80f, b * 0.80f, alfa);
+    glVertex2f(px, py);
+    for (int i = 0; i <= SEGMENTOS_CIRCULO; ++i) {
+        const float angulo = 2.0f * PI * static_cast<float>(i) /
+                             static_cast<float>(SEGMENTOS_CIRCULO);
+        const float nx = std::cos(angulo);
+        const float ny = std::sin(angulo);
+        // Producto punto entre la normal del borde y la direccion al Sol.
+        const float incidencia = nx * dirSolX + ny * dirSolY;
+        float luz = 0.28f + 0.88f * (0.5f + 0.5f * incidencia);
+        if (luz > 1.15f) luz = 1.15f;
+        glColor4f(r * luz, g * luz, b * luz, alfa);
+        glVertex2f(px + radio * nx, py + radio * ny);
+    }
+    glEnd();
+}
+
+// ---------------------------------------------------------------------------
+// Detalles de superficie. Cada mancha esta anclada a una longitud/latitud del
+// cuerpo, asi que al girar este sobre su eje la mancha se desplaza por el disco
+// y desaparece al pasar al lado oculto. La proyeccion es la de una esfera:
+//     x = R * sin(longitud + rotacion) * cos(latitud)
+//     y = R * sin(latitud)
+// y el ancho se estrecha con cos(longitud + rotacion) (escorzo hacia el borde).
+// ---------------------------------------------------------------------------
+static void dibujarManchas(const CuerpoCeleste& cuerpo) {
+    for (int m = 0; m < cuerpo.cantidadManchas; ++m) {
+        const ManchaSuperficie& mancha = cuerpo.manchas[m];
+        const float anguloVisible = mancha.longitud + cuerpo.anguloRotacion;
+        const float profundidad = std::cos(anguloVisible);
+        if (profundidad <= 0.12f) {
+            continue;  // esta en la cara oculta del cuerpo
+        }
+
+        const float cosLatitud = std::cos(mancha.latitud);
+        const float x = cuerpo.posX + cuerpo.radioCuerpo *
+                        std::sin(anguloVisible) * cosLatitud;
+        const float y = cuerpo.posY + cuerpo.radioCuerpo *
+                        std::sin(mancha.latitud);
+        const float radioMancha = mancha.tamano * cuerpo.radioCuerpo *
+                                  profundidad;
+        if (radioMancha < 0.6f) continue;
+
+        // La mancha tambien se oscurece si cae en el lado nocturno.
+        float dirSolX = g_escena.centroX - cuerpo.posX;
+        float dirSolY = g_escena.centroY - cuerpo.posY;
+        const float d = std::sqrt(dirSolX * dirSolX + dirSolY * dirSolY);
+        float luz = 1.0f;
+        if (d > 1.0e-3f) {
+            const float nx = (x - cuerpo.posX) / cuerpo.radioCuerpo;
+            const float ny = (y - cuerpo.posY) / cuerpo.radioCuerpo;
+            const float incidencia = nx * (dirSolX / d) + ny * (dirSolY / d);
+            luz = 0.32f + 0.80f * (0.5f + 0.5f * incidencia);
+        }
+
+        dibujarDisco(x, y, radioMancha,
+                     cuerpo.manchaR * luz, cuerpo.manchaG * luz,
+                     cuerpo.manchaB * luz, 0.85f);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Anillo planetario. Se dibuja en dos mitades: la de atras antes del cuerpo y
+// la de adelante despues, para que el planeta quede correctamente intercalado.
+// ---------------------------------------------------------------------------
+static void dibujarMitadAnillo(const CuerpoCeleste& cuerpo, bool mitadTrasera) {
+    if (!cuerpo.tieneAnillo) return;
+
+    const int pasos = SEGMENTOS_CIRCULO;
+    const float inicio = mitadTrasera ? 0.0f : PI;
+    for (int capa = 0; capa < 2; ++capa) {
+        const float radioX = cuerpo.radioCuerpo * (1.85f + 0.45f * capa);
+        const float radioY = radioX * cuerpo.inclinacionAnillo;
+        glColor4f(cuerpo.manchaR + 0.28f, cuerpo.manchaG + 0.26f,
+                  cuerpo.manchaB + 0.22f, mitadTrasera ? 0.30f : 0.50f);
+        glBegin(GL_LINE_STRIP);
+        for (int i = 0; i <= pasos; ++i) {
+            const float angulo = inicio + PI * static_cast<float>(i) /
+                                 static_cast<float>(pasos);
+            glVertex2f(cuerpo.posX + radioX * std::cos(angulo),
+                       cuerpo.posY + radioY * std::sin(angulo));
+        }
+        glEnd();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Zarcillos de Dark Bramble: filamentos que salen del cuerpo y ondulan con la
+// misma serie de armonicos que perturba su orbita, de modo que el adorno visual
+// y el modelo fisico cuentan la misma historia.
+// ---------------------------------------------------------------------------
+static void dibujarZarcillos(const CuerpoCeleste& cuerpo, float tiempo) {
+    const int cantidadZarcillos = 7;
+    const int segmentos = 9;
+
+    for (int z = 0; z < cantidadZarcillos; ++z) {
+        const float anguloBase = 2.0f * PI * static_cast<float>(z) /
+                                 static_cast<float>(cantidadZarcillos) +
+                                 cuerpo.anguloRotacion;
+        glBegin(GL_LINE_STRIP);
+        for (int s = 0; s <= segmentos; ++s) {
+            const float avance = static_cast<float>(s) /
+                                 static_cast<float>(segmentos);
+            const float largo = cuerpo.radioCuerpo * (1.0f + 2.6f * avance);
+            const float ondulacion = 0.5f * avance *
+                std::sin(2.2f * tiempo + static_cast<float>(z) * 1.7f +
+                         avance * 4.5f + cuerpo.faseOscilacion);
+            const float angulo = anguloBase + ondulacion;
+            glColor4f(cuerpo.colorR + 0.18f, cuerpo.colorG + 0.22f,
+                      cuerpo.colorB + 0.18f, 0.55f * (1.0f - avance));
+            glVertex2f(cuerpo.posX + largo * std::cos(angulo),
+                       cuerpo.posY + largo * std::sin(angulo));
+        }
+        glEnd();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Columna de arena entre los Hourglass Twins: hace visible el recurso
+// compartido que los dos hilos modifican con #pragma omp atomic. Los granos
+// avanzan del donante al receptor.
+// ---------------------------------------------------------------------------
+static void dibujarColumnaDeArena(const CuerpoCeleste& donante,
+                                  const CuerpoCeleste& receptor,
+                                  float tiempo) {
+    const int granos = 16;
+    const float dx = receptor.posX - donante.posX;
+    const float dy = receptor.posY - donante.posY;
+    const float distancia = std::sqrt(dx * dx + dy * dy);
+    if (distancia < 1.0f) return;
+
+    // Vector perpendicular, para dispersar ligeramente los granos.
+    const float perpX = -dy / distancia;
+    const float perpY =  dx / distancia;
+    // Desplazamiento continuo: da la sensacion de flujo hacia el receptor.
+    const float corrimiento = std::fmod(tiempo * 0.45f, 1.0f);
+
+    for (int k = 0; k < granos; ++k) {
+        float avance = (static_cast<float>(k) + corrimiento) /
+                       static_cast<float>(granos);
+        if (avance > 1.0f) avance -= 1.0f;
+        // Se recorta cerca de los extremos para que la arena salga y entre
+        // "desde" la superficie de cada gemelo, no desde su centro.
+        if (avance < 0.12f || avance > 0.88f) continue;
+
+        const float dispersion = (aleatorioDeterminista(
+            static_cast<unsigned int>(k) * 2246822519u) - 0.5f) * 6.0f;
+        const float x = donante.posX + dx * avance + perpX * dispersion;
+        const float y = donante.posY + dy * avance + perpY * dispersion;
+        // Se afina en el centro del chorro, como un reloj de arena.
+        const float grosor = 1.1f + 1.5f * std::fabs(avance - 0.5f);
+        dibujarDisco(x, y, grosor, 0.95f, 0.82f, 0.50f, 0.75f);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fondo estelar. Las estrellas parpadean con una senoidal de frecuencia propia.
+// ---------------------------------------------------------------------------
+static void dibujarEstrellas(float tiempo) {
+    const float ancho = static_cast<float>(g_escena.anchoVentana);
+    const float alto  = static_cast<float>(g_escena.altoVentana);
+
+    glPointSize(2.0f);
+    glBegin(GL_POINTS);
+    for (size_t i = 0; i < g_escena.estrellas.size(); ++i) {
+        const Estrella& estrella = g_escena.estrellas[i];
+        const float parpadeo = 0.75f + 0.25f *
+            std::sin(tiempo * estrella.frecuencia + estrella.fase);
+        const float intensidad = estrella.brillo * parpadeo;
+        glColor4f(0.86f, 0.90f, 1.0f, intensidad);
+        glVertex2f(estrella.x * ancho, estrella.y * alto);
+    }
+    glEnd();
+    glPointSize(1.0f);
+}
+
+// ---------------------------------------------------------------------------
+// Corona del Sol: fulgores que laten con periodos distintos, insinuando ya la
+// inestabilidad que terminara en supernova.
+// ---------------------------------------------------------------------------
+static void dibujarCoronaSolar(float tiempo) {
+    const float radio = g_escena.radioSolActual;
+    for (int i = 0; i < RAYOS_CORONA; ++i) {
+        const float angulo = 2.0f * PI * static_cast<float>(i) /
+                             static_cast<float>(RAYOS_CORONA);
+        const float pulso = 0.5f + 0.5f *
+            std::sin(tiempo * (1.1f + 0.37f * static_cast<float>(i % 5)) +
+                     static_cast<float>(i) * 2.3f);
+        const float largo = radio * (1.25f + 0.75f * pulso);
+        const float mediaBase = 0.10f;
+
+        const float dirX = std::cos(angulo);
+        const float dirY = std::sin(angulo);
+        const float ladoX = std::cos(angulo + mediaBase);
+        const float ladoY = std::sin(angulo + mediaBase);
+        const float otroX = std::cos(angulo - mediaBase);
+        const float otroY = std::sin(angulo - mediaBase);
+
+        glBegin(GL_TRIANGLES);
+        glColor4f(1.0f, 0.72f, 0.28f, 0.22f);
+        glVertex2f(g_escena.centroX + radio * ladoX,
+                   g_escena.centroY + radio * ladoY);
+        glVertex2f(g_escena.centroX + radio * otroX,
+                   g_escena.centroY + radio * otroY);
+        glColor4f(1.0f, 0.45f, 0.08f, 0.0f);
+        glVertex2f(g_escena.centroX + largo * dirX,
+                   g_escena.centroY + largo * dirY);
+        glEnd();
+    }
 }
 
 // Traza la orbita de referencia. Cada tipo de fisica describe una curva
@@ -828,8 +1231,10 @@ static void dibujarColaCometa(const CuerpoCeleste& cuerpo) {
     }
 }
 
-// Dibuja el Sol: nucleo brillante mas varias capas de halo semitransparente.
-static void dibujarSol() {
+// Dibuja el Sol: corona de fulgores, capas de halo y nucleo brillante.
+static void dibujarSol(float tiempo) {
+    dibujarCoronaSolar(tiempo);
+
     const int capasHalo = 10;
     for (int capa = capasHalo; capa >= 1; --capa) {
         const float factor = 1.0f + 0.22f * static_cast<float>(capa);
@@ -856,6 +1261,13 @@ static void dibujarTexto(float x, float y, const std::string& texto,
 static void alDibujar() {
     glClear(GL_COLOR_BUFFER_BIT);
 
+    const float tiempo = g_escena.tiempoAcumulado;
+    // Nivel de detalle: con muchos cuerpos el adorno fino ni se distingue y el
+    // renderizado (que es secuencial) se volveria el cuello de botella.
+    const bool detalleFino = g_escena.cuerpos.size() <= LIMITE_DETALLE_FINO;
+
+    dibujarEstrellas(tiempo);
+
     // Orbitas de referencia (solo si son pocas, para no saturar la pantalla).
     if (g_escena.cuerpos.size() <= 64) {
         for (size_t i = 0; i < g_escena.cuerpos.size(); ++i) {
@@ -865,20 +1277,68 @@ static void alDibujar() {
         }
     }
 
-    dibujarSol();
+    dibujarSol(tiempo);
+
+    // La columna de arena va por debajo de los gemelos, para que estos la
+    // tapen en los extremos y parezca que sale de su superficie.
+    if (detalleFino) {
+        for (size_t i = 0; i < g_escena.cuerpos.size(); ++i) {
+            const CuerpoCeleste& cuerpo = g_escena.cuerpos[i];
+            if (cuerpo.tipo == FISICA_BINARIA && cuerpo.esDonanteDeArena &&
+                cuerpo.indiceCompanero >= 0) {
+                dibujarColumnaDeArena(
+                    cuerpo,
+                    g_escena.cuerpos[static_cast<size_t>(cuerpo.indiceCompanero)],
+                    tiempo);
+            }
+        }
+    }
 
     // Los cuerpos celestes, con el adorno propio de su tipo de fisica.
     for (size_t i = 0; i < g_escena.cuerpos.size(); ++i) {
         const CuerpoCeleste& cuerpo = g_escena.cuerpos[i];
 
+        // --- Adornos que van DETRAS del cuerpo ---
         if (cuerpo.tipo == FISICA_KEPLERIANA) {
             dibujarColaCometa(cuerpo);
         }
+        if (detalleFino && cuerpo.tipo == FISICA_OSCILANTE) {
+            dibujarZarcillos(cuerpo, tiempo);
+        }
+        if (detalleFino && cuerpo.tipo == FISICA_CUANTICA &&
+            cuerpo.tiempoEstela > 0.0f) {
+            // Estela del ultimo salto, desvaneciendose donde estaba antes.
+            const float resto = cuerpo.tiempoEstela / DURACION_ESTELA;
+            dibujarDisco(cuerpo.posEstelaX, cuerpo.posEstelaY,
+                         cuerpo.radioCuerpo * (1.0f + 0.9f * (1.0f - resto)),
+                         cuerpo.colorR, cuerpo.colorG, cuerpo.colorB,
+                         0.40f * resto);
+            dibujarContorno(cuerpo.posEstelaX, cuerpo.posEstelaY,
+                            cuerpo.radioCuerpo * 2.4f,
+                            cuerpo.colorR, cuerpo.colorG, cuerpo.colorB,
+                            0.35f * resto);
+        }
+        if (detalleFino) {
+            dibujarMitadAnillo(cuerpo, true);   // mitad trasera del anillo
+        }
 
-        dibujarDisco(cuerpo.posX, cuerpo.posY, cuerpo.radioCuerpo * 1.8f,
-                     cuerpo.colorR, cuerpo.colorG, cuerpo.colorB, 0.18f);
-        dibujarDisco(cuerpo.posX, cuerpo.posY, cuerpo.radioCuerpo,
-                     cuerpo.colorR, cuerpo.colorG, cuerpo.colorB, 1.0f);
+        // --- Atmosfera y cuerpo ---
+        dibujarDisco(cuerpo.posX, cuerpo.posY, cuerpo.radioCuerpo * 1.42f,
+                     cuerpo.colorR, cuerpo.colorG, cuerpo.colorB, 0.15f);
+        dibujarDiscoIluminado(cuerpo.posX, cuerpo.posY, cuerpo.radioCuerpo,
+                              cuerpo.colorR, cuerpo.colorG, cuerpo.colorB, 1.0f);
+
+        // --- Adornos que van ENCIMA del cuerpo ---
+        if (detalleFino) {
+            dibujarManchas(cuerpo);
+            dibujarMitadAnillo(cuerpo, false);  // mitad delantera del anillo
+
+            if (cuerpo.tipo == FISICA_KEPLERIANA) {
+                // Nucleo helado: un punto muy brillante en el centro.
+                dibujarDisco(cuerpo.posX, cuerpo.posY, cuerpo.radioCuerpo * 0.45f,
+                             0.97f, 0.99f, 1.0f, 0.85f);
+            }
+        }
 
         if (cuerpo.tipo == FISICA_CUANTICA) {
             dibujarContorno(cuerpo.posX, cuerpo.posY, cuerpo.radioCuerpo * 2.4f,
@@ -1029,18 +1489,23 @@ static void alRedimensionar(int ancho, int alto) {
 static void alEstarOcioso() {
     const std::chrono::steady_clock::time_point ahora =
         std::chrono::steady_clock::now();
-    float dt = std::chrono::duration<float>(ahora - g_marcaTiempoPrevia).count();
+    // dtReal es el tiempo de pared que tardo el cuadro: es el que debe usarse
+    // para medir FPS. dt es el paso de simulacion, recortado para que la fisica
+    // no de un salto si la ventana se minimiza o el proceso se detiene.
+    // Confundirlos hace que el contador de FPS se sature (nunca bajaria de
+    // 1/DT_MAXIMO), justo en los valores de N que interesa medir.
+    float dtReal = std::chrono::duration<float>(ahora - g_marcaTiempoPrevia).count();
     g_marcaTiempoPrevia = ahora;
+    if (dtReal < 0.0f) dtReal = 0.0f;
 
-    // Proteccion contra saltos grandes (ventana minimizada, breakpoint, etc.)
-    if (dt < 0.0f)       dt = 0.0f;
-    if (dt > DT_MAXIMO)  dt = DT_MAXIMO;
+    float dt = dtReal;
+    if (dt > DT_MAXIMO) dt = DT_MAXIMO;
 
     actualizarEscena(dt);
 
     // Promedio de FPS sobre una ventana de tiempo fija, mas estable que 1/dt.
     g_escena.framesEnIntervalo += 1;
-    g_escena.tiempoEnIntervalo += dt;
+    g_escena.tiempoEnIntervalo += dtReal;
     if (g_escena.tiempoEnIntervalo >= INTERVALO_FPS) {
         g_escena.fpsActual = static_cast<float>(g_escena.framesEnIntervalo) /
                              g_escena.tiempoEnIntervalo;

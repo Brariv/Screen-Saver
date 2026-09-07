@@ -111,6 +111,19 @@ static const int    RAYOS_CORONA           = 28;   // fulgores del Sol
 // cuello de botella en las pruebas de carga.
 static const size_t LIMITE_DETALLE_FINO    = 200;
 
+// --- Nave exploradora ---
+static const float  NAVE_RAPIDEZ_MAXIMA    = 230.0f; // px/s
+static const float  NAVE_AGILIDAD          = 2.0f;   // suavizado del viraje
+static const float  NAVE_ESPERA_EN_DESTINO = 2.5f;   // s parada en cada planeta
+static const size_t NAVE_LARGO_ESTELA      = 34;     // muestras de la estela
+
+// --- Secuencia final (asteroide -> supernova -> cierre) ---
+static const float  FINAL_GM_ASTEROIDE     = 900000.0f; // atraccion al Sol
+static const float  FINAL_DURACION_ONDA    = 2.3f;      // s de la explosion
+static const float  FINAL_DURACION_APAGADO = 1.1f;      // s de fundido a negro
+static const float  FINAL_VELOCIDAD_ONDA   = 950.0f;    // px/s del frente
+static const int    FINAL_CANTIDAD_ESCOMBROS = 260;
+
 // ============================================================================
 //  TIPOS DE FISICA
 // ============================================================================
@@ -125,11 +138,22 @@ enum TipoFisica {
     FISICA_SATELITE,       // depende de la posicion de su cuerpo padre
     FISICA_CUANTICA,       // reposicionamiento discreto por hash determinista
     FISICA_OSCILANTE,      // orbita perturbada por K armonicos senoidales
+    FISICA_ESTACION,       // Sun Station: orbita rasante al Sol + giro propio
+    FISICA_NAVE,           // nave: navegacion vectorial con llegada suave
     CANTIDAD_TIPOS_FISICA
 };
 
 static const char* NOMBRES_FISICA[CANTIDAD_TIPOS_FISICA] = {
-    "circular", "kepler", "binaria", "satelite", "cuantica", "oscilante"
+    "circular", "kepler", "binaria", "satelite", "cuantica", "oscilante",
+    "estacion", "nave"
+};
+
+// Etapas de la secuencia de cierre que se dispara con ESC o 'q'.
+enum EstadoFinal {
+    FINAL_INACTIVO = 0,  // funcionamiento normal
+    FINAL_ASTEROIDE,     // un asteroide cae hacia el Sol
+    FINAL_EXPLOSION,     // impacto: supernova y onda expansiva
+    FINAL_APAGADO        // fundido a negro antes de cerrar
 };
 
 // ============================================================================
@@ -153,6 +177,16 @@ struct Estrella {
     float brillo;      // 0..1
     float frecuencia;  // velocidad del parpadeo
     float fase;        // desfase del parpadeo
+};
+
+// Fragmento lanzado por la supernova durante la secuencia de cierre.
+struct Escombro {
+    float x, y;
+    float velX, velY;
+    float radio;
+    float r, g, b;
+    float vida;     // segundos restantes
+    float vidaTotal;
 };
 
 // Un cuerpo celeste. Salvo el caso del satelite (que lee a su padre) y el de
@@ -200,6 +234,22 @@ struct CuerpoCeleste {
     float amplitudOscilacion;   // amplitud relativa de la perturbacion
     float faseOscilacion;       // desfase base de la serie
 
+    // --- FISICA_ESTACION ---
+    float radioAnillo;          // radio del anillo estructural (px)
+
+    // --- FISICA_NAVE ---
+    float velX, velY;           // velocidad lineal (px/s)
+    float rumbo;                // orientacion, derivada de la velocidad (rad)
+    int   indiceObjetivo;       // cuerpo hacia el que viaja
+    float tiempoEnDestino;      // segundos que lleva junto a su objetivo
+    float empuje;               // 0..1, intensidad de la llama del motor
+    unsigned int contadorViajes;// cuantos destinos lleva visitados
+
+    // --- Secuencia final ---
+    float velFinalX, velFinalY; // velocidad al ser barrido por la onda
+    bool  empujadoPorOnda;      // ya lo alcanzo el frente de la explosion
+    float opacidad;             // 1 normal, baja mientras se desintegra
+
     // --- Comunes ---
     float radioBase;            // radio nominal dibujado (px)
     float radioCuerpo;          // radio efectivo del cuadro actual (px)
@@ -226,10 +276,21 @@ struct EstadoEscena {
     // El arreglo se recorre en dos fases porque los satelites dependen de la
     // posicion ya actualizada de su padre. Guardar los indices separados evita
     // meter un 'if' dentro del bucle paralelo.
-    std::vector<int> indicesPrimarios;  // todos los que NO son satelites
-    std::vector<int> indicesSatelites;  // los que dependen de un padre
+    std::vector<int> indicesPrimarios;    // no dependen de nadie
+    std::vector<int> indicesDependientes; // satelites y nave: leen a otro cuerpo
+    std::vector<int> indicesDestinoNave;  // planetas a los que puede viajar
+    int indiceNave;                       // -1 si no hay nave en la escena
+
+    // Estela de la nave (posiciones recientes). Vive aqui y no en el cuerpo
+    // porque se actualiza durante el dibujado, que es secuencial, y porque un
+    // arreglo por cuerpo multiplicaria la memoria con N grande.
+    std::vector<float> estelaNaveX;
+    std::vector<float> estelaNaveY;
+    size_t estelaCursor;
+    size_t estelaLlenas;
 
     int conteoPorTipo[CANTIDAD_TIPOS_FISICA];
+    long cuerposSolicitados;  // el N que pidio el usuario (sin estacion ni nave)
 
     std::vector<Estrella> estrellas;    // fondo estelar (coordenadas 0..1)
 
@@ -244,16 +305,33 @@ struct EstadoEscena {
     float radioSolActual;
     float tiempoAcumulado;
 
+    // --- Secuencia de cierre ---
+    EstadoFinal estadoFinal;
+    float tiempoEnEtapa;       // segundos dentro de la etapa actual
+    float asteroideX, asteroideY;
+    float asteroideVelX, asteroideVelY;
+    float asteroideRadio;
+    float asteroideGiro;
+    float radioOnda;           // radio del frente de la explosion
+    float destello;            // 0..1, fogonazo blanco del impacto
+    std::vector<Escombro> escombros;
+
     // Medicion de FPS
     int   framesEnIntervalo;
     float tiempoEnIntervalo;
     float fpsActual;
 
     EstadoEscena()
-        : arenaTransferida(0.0f),
+        : indiceNave(-1), estelaCursor(0), estelaLlenas(0),
+          cuerposSolicitados(0), arenaTransferida(0.0f),
           anchoVentana(ANCHO_POR_DEFECTO), altoVentana(ALTO_POR_DEFECTO),
           centroX(0.0f), centroY(0.0f), radioSolBase(40.0f),
           radioSolActual(40.0f), tiempoAcumulado(0.0f),
+          estadoFinal(FINAL_INACTIVO), tiempoEnEtapa(0.0f),
+          asteroideX(0.0f), asteroideY(0.0f),
+          asteroideVelX(0.0f), asteroideVelY(0.0f),
+          asteroideRadio(14.0f), asteroideGiro(0.0f),
+          radioOnda(0.0f), destello(0.0f),
           framesEnIntervalo(0), tiempoEnIntervalo(0.0f), fpsActual(0.0f) {
         for (int i = 0; i < CANTIDAD_TIPOS_FISICA; ++i) conteoPorTipo[i] = 0;
     }
@@ -495,7 +573,124 @@ static void fisicaOscilante(CuerpoCeleste& c, float dt, float tiempo,
 }
 
 // ---------------------------------------------------------------------------
-// 6) FISICA_SATELITE - The Attlerock.
+// 6) FISICA_ESTACION - Sun Station.
+//
+//    Orbita rasante y muy rapida pegada al Sol, practicamente circular. Como
+//    esta tan cerca, se le anade una precesion: el radio late ligeramente por
+//    el tiron de marea del Sol. Ademas la estructura gira sobre si misma a un
+//    ritmo distinto del orbital, lo que se aprecia en el anillo.
+// ---------------------------------------------------------------------------
+static void fisicaEstacion(CuerpoCeleste& c, float dt, float tiempo,
+                           float cx, float cy, float radioSol) {
+    c.anguloOrbital = normalizarAngulo(c.anguloOrbital +
+                                       c.velocidadAngular * dt);
+
+    // El radio se referencia al Sol actual para que la estacion siga pegada a
+    // el aunque el Sol este pulsando (o creciendo en la secuencia final).
+    const float radioBaseOrbita = radioSol * 1.75f;
+    const float marea = 1.0f + 0.05f * std::sin(tiempo * 2.3f);
+    const float radio = radioBaseOrbita * marea;
+
+    c.posX = cx + radio * std::cos(c.anguloOrbital);
+    c.posY = cy + radio * 0.92f * std::sin(c.anguloOrbital);
+    c.radioCuerpo = c.radioBase;
+}
+
+// ---------------------------------------------------------------------------
+// 7) FISICA_NAVE - la nave exploradora.
+//
+//    Es el unico cuerpo que NO sigue una orbita: navega. Usa un modelo de
+//    direccion vectorial con "llegada suave" (arrival steering):
+//
+//        rapidezDeseada = min(rapidezMaxima, distancia * factorFrenado)
+//        velDeseada     = direccionAlObjetivo * rapidezDeseada
+//        vel           += (velDeseada - vel) * min(1, agilidad * dt)
+//        pos           += vel * dt
+//
+//    El termino de frenado hace que desacelere sola al acercarse en vez de
+//    pasarse de largo. Cuando lleva un rato junto al planeta elige otro destino
+//    con la misma funcion de hash determinista que la luna cuantica, asi que
+//    tampoco necesita un generador con estado compartido.
+//
+//    Depende de la posicion ya actualizada de su objetivo, asi que se resuelve
+//    en la segunda fase, despues de la barrera.
+// ---------------------------------------------------------------------------
+static void fisicaNave(CuerpoCeleste& c, const CuerpoCeleste* cuerpos,
+                       const int* destinos, int cantidadDestinos, float dt) {
+    if (cantidadDestinos <= 0) {
+        return;  // no hay a donde ir: la nave se queda a la deriva
+    }
+
+    // Elige destino si no tiene uno valido todavia.
+    if (c.indiceObjetivo < 0) {
+        const unsigned int semilla =
+            static_cast<unsigned int>(c.contadorViajes) * 2246822519u + 7919u;
+        c.indiceObjetivo = destinos[mezclarEntero(semilla) %
+                                    static_cast<unsigned int>(cantidadDestinos)];
+    }
+
+    const CuerpoCeleste& objetivo = cuerpos[c.indiceObjetivo];
+    const float dx = objetivo.posX - c.posX;
+    const float dy = objetivo.posY - c.posY;
+    const float distancia = std::sqrt(dx * dx + dy * dy);
+
+    // Radio a partir del cual se considera que "llego" al planeta.
+    const float radioLlegada = objetivo.radioCuerpo * 2.2f + 22.0f;
+
+    if (distancia < radioLlegada) {
+        c.tiempoEnDestino += dt;
+        if (c.tiempoEnDestino >= NAVE_ESPERA_EN_DESTINO) {
+            c.tiempoEnDestino = 0.0f;
+            c.contadorViajes += 1u;
+            const unsigned int semilla =
+                static_cast<unsigned int>(c.contadorViajes) * 2246822519u + 7919u;
+            c.indiceObjetivo = destinos[mezclarEntero(semilla) %
+                                        static_cast<unsigned int>(cantidadDestinos)];
+        }
+    } else {
+        c.tiempoEnDestino = 0.0f;
+    }
+
+    // Velocidad deseada con frenado proporcional a la distancia restante.
+    float rapidezDeseada = distancia * 1.3f;
+    if (rapidezDeseada > NAVE_RAPIDEZ_MAXIMA) {
+        rapidezDeseada = NAVE_RAPIDEZ_MAXIMA;
+    }
+    float deseadaX = 0.0f;
+    float deseadaY = 0.0f;
+    if (distancia > 1.0e-3f) {
+        deseadaX = (dx / distancia) * rapidezDeseada;
+        deseadaY = (dy / distancia) * rapidezDeseada;
+    }
+
+    // Ademas de perseguir, arrastra la velocidad orbital del planeta destino
+    // para poder acompanarlo en vez de quedarse atras.
+    float mezcla = NAVE_AGILIDAD * dt;
+    if (mezcla > 1.0f) mezcla = 1.0f;
+    const float correccionX = (deseadaX - c.velX) * mezcla;
+    const float correccionY = (deseadaY - c.velY) * mezcla;
+    c.velX += correccionX;
+    c.velY += correccionY;
+
+    c.posX += c.velX * dt;
+    c.posY += c.velY * dt;
+
+    // El motor se enciende en proporcion a cuanto tuvo que corregir el rumbo.
+    const float magnitudCorreccion =
+        std::sqrt(correccionX * correccionX + correccionY * correccionY);
+    c.empuje = magnitudCorreccion / (NAVE_RAPIDEZ_MAXIMA * 0.35f);
+    if (c.empuje > 1.0f) c.empuje = 1.0f;
+
+    // La nave siempre apunta hacia donde se mueve.
+    const float rapidez = std::sqrt(c.velX * c.velX + c.velY * c.velY);
+    if (rapidez > 4.0f) {
+        c.rumbo = std::atan2(c.velY, c.velX);
+    }
+    c.radioCuerpo = c.radioBase;
+}
+
+// ---------------------------------------------------------------------------
+// 8) FISICA_SATELITE - The Attlerock.
 //
 //    Unico modelo con DEPENDENCIA DE DATOS: necesita la posicion ya actualizada
 //    de su cuerpo padre. Por eso se ejecuta en una segunda fase, despues de la
@@ -508,6 +703,209 @@ static void fisicaSatelite(CuerpoCeleste& c, const CuerpoCeleste& padre,
     c.posX = padre.posX + c.radioLocal * std::cos(c.anguloOrbital);
     c.posY = padre.posY + c.radioLocal * 0.9f * std::sin(c.anguloOrbital);
     c.radioCuerpo = c.radioBase;
+}
+
+// ============================================================================
+//  SECUENCIA DE CIERRE: asteroide -> supernova -> apagado
+// ============================================================================
+
+// Lanza el asteroide desde fuera de la ventana, con una velocidad inicial
+// dirigida al Sol. A partir de ahi lo gobierna la gravedad, asi que llega
+// acelerando (atraccion inversa al cuadrado de la distancia).
+static void iniciarSecuenciaFinal() {
+    if (g_escena.estadoFinal != FINAL_INACTIVO) {
+        return;  // ya esta en marcha; una segunda pulsacion fuerza la salida
+    }
+
+    g_escena.estadoFinal   = FINAL_ASTEROIDE;
+    g_escena.tiempoEnEtapa = 0.0f;
+    g_escena.radioOnda     = 0.0f;
+    g_escena.destello      = 0.0f;
+
+    // Entra por una esquina elegida con el reloj, para que no sea siempre igual.
+    const unsigned int semilla = static_cast<unsigned int>(
+        g_escena.tiempoAcumulado * 1000.0f);
+    const float anguloEntrada = aleatorioDeterminista(semilla) * 2.0f * PI;
+    // Justo fuera de la ventana: la diagonal completa por 0.6 deja margen
+    // suficiente para que entre en cuadro ya acelerando.
+    const float diagonal = std::sqrt(
+        static_cast<float>(g_escena.anchoVentana) *
+        static_cast<float>(g_escena.anchoVentana) +
+        static_cast<float>(g_escena.altoVentana) *
+        static_cast<float>(g_escena.altoVentana));
+    const float distanciaEntrada = 0.60f * diagonal;
+
+    g_escena.asteroideX = g_escena.centroX +
+                          distanciaEntrada * std::cos(anguloEntrada);
+    g_escena.asteroideY = g_escena.centroY +
+                          distanciaEntrada * std::sin(anguloEntrada);
+    g_escena.asteroideRadio = 15.0f;
+    g_escena.asteroideGiro  = 0.0f;
+
+    // Velocidad inicial hacia el Sol, con un ligero sesgo lateral para que la
+    // trayectoria se vea como una caida y no como una linea recta.
+    const float haciaSolX = g_escena.centroX - g_escena.asteroideX;
+    const float haciaSolY = g_escena.centroY - g_escena.asteroideY;
+    const float d = std::sqrt(haciaSolX * haciaSolX + haciaSolY * haciaSolY);
+    const float rapidezInicial = 300.0f;
+    const float sesgoLateral   = 140.0f;
+    g_escena.asteroideVelX = (haciaSolX / d) * rapidezInicial -
+                             (haciaSolY / d) * sesgoLateral;
+    g_escena.asteroideVelY = (haciaSolY / d) * rapidezInicial +
+                             (haciaSolX / d) * sesgoLateral;
+
+    std::printf("\n>> Asteroide en curso de colision con el Sol...\n");
+    std::fflush(stdout);
+}
+
+// Genera los fragmentos que salen despedidos del Sol en el impacto.
+static void dispararEscombros() {
+    g_escena.escombros.clear();
+    g_escena.escombros.reserve(FINAL_CANTIDAD_ESCOMBROS);
+
+    for (int i = 0; i < FINAL_CANTIDAD_ESCOMBROS; ++i) {
+        const unsigned int base = static_cast<unsigned int>(i) * 2654435761u;
+        Escombro fragmento;
+
+        const float angulo = aleatorioDeterminista(base) * 2.0f * PI;
+        const float rapidez = 180.0f + 780.0f * aleatorioDeterminista(base + 1u);
+        fragmento.x = g_escena.centroX;
+        fragmento.y = g_escena.centroY;
+        fragmento.velX = std::cos(angulo) * rapidez;
+        fragmento.velY = std::sin(angulo) * rapidez;
+        fragmento.radio = 1.5f + 4.5f * aleatorioDeterminista(base + 2u);
+
+        // Paleta del Sol: del blanco incandescente al naranja profundo.
+        const float calor = aleatorioDeterminista(base + 3u);
+        fragmento.r = 1.0f;
+        fragmento.g = 0.45f + 0.50f * calor;
+        fragmento.b = 0.10f + 0.55f * calor * calor;
+
+        fragmento.vidaTotal = 1.2f + 1.6f * aleatorioDeterminista(base + 4u);
+        fragmento.vida = fragmento.vidaTotal;
+        g_escena.escombros.push_back(fragmento);
+    }
+}
+
+// Avanza la parte secuencial de la secuencia final: asteroide, onda, escombros
+// y temporizadores de etapa. El empuje de los cuerpos se hace aparte, en
+// paralelo, dentro de actualizarEscena().
+static void actualizarSecuenciaFinal(float dt) {
+    g_escena.tiempoEnEtapa += dt;
+
+    if (g_escena.estadoFinal == FINAL_ASTEROIDE) {
+        // Atraccion gravitatoria del Sol: a = GM / r^2, dirigida al centro.
+        const float dx = g_escena.centroX - g_escena.asteroideX;
+        const float dy = g_escena.centroY - g_escena.asteroideY;
+        float distanciaCuadrado = dx * dx + dy * dy;
+        if (distanciaCuadrado < 1.0f) distanciaCuadrado = 1.0f;
+        const float distancia = std::sqrt(distanciaCuadrado);
+
+        const float radialX = dx / distancia;
+        const float radialY = dy / distancia;
+
+        const float aceleracion = FINAL_GM_ASTEROIDE / distanciaCuadrado;
+        g_escena.asteroideVelX += radialX * aceleracion * dt;
+        g_escena.asteroideVelY += radialY * aceleracion * dt;
+
+        // Amortiguamiento de la componente tangencial. Con gravedad pura y algo
+        // de velocidad lateral el asteroide describiria una hiperbola y pasaria
+        // de largo; aqui interesa que SIEMPRE impacte, asi que se le resta
+        // momento angular de forma progresiva. Es una espiral de caida, no una
+        // trayectoria balistica: esto es una animacion de cierre, no una
+        // simulacion, y se documenta como tal.
+        const float componenteRadial = g_escena.asteroideVelX * radialX +
+                                       g_escena.asteroideVelY * radialY;
+        float tangencialX = g_escena.asteroideVelX - componenteRadial * radialX;
+        float tangencialY = g_escena.asteroideVelY - componenteRadial * radialY;
+        float amortiguado = 1.0f - 1.7f * dt;
+        if (amortiguado < 0.0f) amortiguado = 0.0f;
+        tangencialX *= amortiguado;
+        tangencialY *= amortiguado;
+        g_escena.asteroideVelX = componenteRadial * radialX + tangencialX;
+        g_escena.asteroideVelY = componenteRadial * radialY + tangencialY;
+
+        g_escena.asteroideX += g_escena.asteroideVelX * dt;
+        g_escena.asteroideY += g_escena.asteroideVelY * dt;
+        g_escena.asteroideGiro = normalizarAngulo(g_escena.asteroideGiro + 3.2f * dt);
+
+        // El asteroide se calienta y se hincha al acercarse.
+        const float proximidad = 1.0f -
+            distancia / (0.75f * static_cast<float>(g_escena.anchoVentana));
+        g_escena.asteroideRadio = 15.0f +
+            10.0f * (proximidad > 0.0f ? proximidad : 0.0f);
+
+        // Impacto. La condicion de tiempo es una red de seguridad: pase lo que
+        // pase con la trayectoria, el screensaver nunca se queda colgado sin
+        // poder cerrarse.
+        if (distancia <= g_escena.radioSolActual + g_escena.asteroideRadio ||
+            g_escena.tiempoEnEtapa > 6.0f) {
+            g_escena.estadoFinal   = FINAL_EXPLOSION;
+            g_escena.tiempoEnEtapa = 0.0f;
+            g_escena.radioOnda     = g_escena.radioSolActual;
+            g_escena.destello      = 0.80f;
+            dispararEscombros();
+            std::printf(">> IMPACTO. El Sol entra en supernova.\n");
+            std::fflush(stdout);
+        }
+        return;
+    }
+
+    if (g_escena.estadoFinal == FINAL_EXPLOSION) {
+        // Frente de la onda expansiva y fogonazo que se apaga.
+        g_escena.radioOnda += FINAL_VELOCIDAD_ONDA * dt;
+        g_escena.destello -= dt * 4.5f;   // fogonazo breve, no un velo largo
+        if (g_escena.destello < 0.0f) g_escena.destello = 0.0f;
+
+        // El Sol se hincha de golpe y luego se desvanece.
+        // El nucleo se hincha de golpe y despues COLAPSA: la estrella queda
+        // destruida. Lo que sigue viendose es el cascaron en expansion, no un
+        // disco gigante ocupando el centro de la pantalla.
+        float avance = g_escena.tiempoEnEtapa / FINAL_DURACION_ONDA;
+        if (avance > 1.0f) avance = 1.0f;
+
+        float hinchazon;
+        if (avance < 0.25f) {
+            hinchazon = 1.0f + 8.8f * avance;              // 1x -> 3.2x
+        } else {
+            float restante = 1.0f - (avance - 0.25f) / 0.45f;
+            if (restante < 0.0f) restante = 0.0f;
+            hinchazon = 3.2f * restante;                    // 3.2x -> 0
+        }
+        g_escena.radioSolActual = g_escena.radioSolBase * hinchazon;
+
+        // Escombros: movimiento inercial con un leve frenado.
+        for (size_t i = 0; i < g_escena.escombros.size(); ++i) {
+            Escombro& fragmento = g_escena.escombros[i];
+            if (fragmento.vida <= 0.0f) continue;
+            fragmento.x += fragmento.velX * dt;
+            fragmento.y += fragmento.velY * dt;
+            fragmento.velX *= (1.0f - 0.55f * dt);
+            fragmento.velY *= (1.0f - 0.55f * dt);
+            fragmento.vida -= dt;
+        }
+
+        if (g_escena.tiempoEnEtapa >= FINAL_DURACION_ONDA) {
+            g_escena.estadoFinal   = FINAL_APAGADO;
+            g_escena.tiempoEnEtapa = 0.0f;
+        }
+        return;
+    }
+
+    if (g_escena.estadoFinal == FINAL_APAGADO) {
+        for (size_t i = 0; i < g_escena.escombros.size(); ++i) {
+            Escombro& fragmento = g_escena.escombros[i];
+            if (fragmento.vida <= 0.0f) continue;
+            fragmento.x += fragmento.velX * dt;
+            fragmento.y += fragmento.velY * dt;
+            fragmento.vida -= dt;
+        }
+        if (g_escena.tiempoEnEtapa >= FINAL_DURACION_APAGADO) {
+            std::printf(">> Fin del ciclo. Cerrando screensaver.\n");
+            std::fflush(stdout);
+            std::exit(EXIT_SUCCESS);
+        }
+    }
 }
 
 // ============================================================================
@@ -532,16 +930,73 @@ static void fisicaSatelite(CuerpoCeleste& c, const CuerpoCeleste& padre,
 // mucho antes que otro. En la segunda fase, en cambio, todos los satelites
 // cuestan lo mismo, asi que el reparto estatico es el adecuado.
 static void actualizarEscena(float dt) {
-    // --- Sol: pulso de brillo/tamano (preludio del ciclo de supernova) ---
     g_escena.tiempoAcumulado += dt;
+
+    CuerpoCeleste* cuerpos      = g_escena.cuerpos.data();
+    const int      numCuerpos   = static_cast<int>(g_escena.cuerpos.size());
+    const int*     primarios    = g_escena.indicesPrimarios.data();
+    const int      numPrimarios = static_cast<int>(g_escena.indicesPrimarios.size());
+    const int*     dependientes = g_escena.indicesDependientes.data();
+    const int      numDependientes =
+        static_cast<int>(g_escena.indicesDependientes.size());
+    const int*     destinos     = g_escena.indicesDestinoNave.data();
+    const int      numDestinos  = static_cast<int>(g_escena.indicesDestinoNave.size());
+
+    // ------------------------------------------------------------------
+    // Secuencia de cierre. Durante la caida del asteroide la escena sigue
+    // animandose con normalidad; a partir del impacto los cuerpos dejan de
+    // orbitar y salen despedidos por la onda expansiva.
+    // ------------------------------------------------------------------
+
+    // Pulso normal del Sol. Durante la explosion, actualizarSecuenciaFinal()
+    // sobrescribe este valor con la hinchazon de la supernova.
     g_escena.radioSolActual = g_escena.radioSolBase *
         (1.0f + 0.06f * std::sin(g_escena.tiempoAcumulado * 1.2f));
 
-    CuerpoCeleste* cuerpos      = g_escena.cuerpos.data();
-    const int*     primarios    = g_escena.indicesPrimarios.data();
-    const int      numPrimarios = static_cast<int>(g_escena.indicesPrimarios.size());
-    const int*     satelites    = g_escena.indicesSatelites.data();
-    const int      numSatelites = static_cast<int>(g_escena.indicesSatelites.size());
+    if (g_escena.estadoFinal != FINAL_INACTIVO) {
+        actualizarSecuenciaFinal(dt);
+
+        if (g_escena.estadoFinal == FINAL_EXPLOSION ||
+            g_escena.estadoFinal == FINAL_APAGADO) {
+            const float cxOnda = g_escena.centroX;
+            const float cyOnda = g_escena.centroY;
+            const float frente = g_escena.radioOnda;
+
+            // El barrido de la onda tambien se reparte entre hilos: cada cuerpo
+            // solo lee el radio del frente y escribe su propio estado.
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int i = 0; i < numCuerpos; ++i) {
+                CuerpoCeleste& cuerpo = cuerpos[i];
+                const float dx = cuerpo.posX - cxOnda;
+                const float dy = cuerpo.posY - cyOnda;
+                const float distancia = std::sqrt(dx * dx + dy * dy);
+
+                if (!cuerpo.empujadoPorOnda && frente >= distancia) {
+                    // La onda lo alcanza: sale despedido radialmente, mas
+                    // rapido cuanto mas cerca estaba del Sol.
+                    const float atenuacion = 260.0f / (60.0f + distancia);
+                    const float impulso = 240.0f + 900.0f * atenuacion;
+                    const float nx = (distancia > 1.0e-3f) ? dx / distancia : 1.0f;
+                    const float ny = (distancia > 1.0e-3f) ? dy / distancia : 0.0f;
+                    cuerpo.velFinalX = nx * impulso - ny * impulso * 0.25f;
+                    cuerpo.velFinalY = ny * impulso + nx * impulso * 0.25f;
+                    cuerpo.empujadoPorOnda = true;
+                }
+
+                if (cuerpo.empujadoPorOnda) {
+                    cuerpo.posX += cuerpo.velFinalX * dt;
+                    cuerpo.posY += cuerpo.velFinalY * dt;
+                    cuerpo.anguloRotacion = normalizarAngulo(
+                        cuerpo.anguloRotacion + 6.0f * dt);
+                    cuerpo.opacidad -= dt * 0.85f;
+                    if (cuerpo.opacidad < 0.0f) cuerpo.opacidad = 0.0f;
+                }
+            }
+            return;  // no se ejecuta la fisica orbital normal
+        }
+    }
 
     const float cx     = g_escena.centroX;
     const float cy     = g_escena.centroY;
@@ -588,6 +1043,10 @@ static void actualizarEscena(float dt) {
                 case FISICA_OSCILANTE:
                     fisicaOscilante(cuerpo, dt, tiempo, cx, cy);
                     break;
+                case FISICA_ESTACION:
+                    fisicaEstacion(cuerpo, dt, tiempo, cx, cy,
+                                   g_escena.radioSolActual);
+                    break;
                 case FISICA_CIRCULAR:
                 default:
                     fisicaCircular(cuerpo, dt, cx, cy);
@@ -597,12 +1056,14 @@ static void actualizarEscena(float dt) {
         // Barrera implicita al cerrar el 'omp for': a partir de aqui todos los
         // cuerpos primarios tienen su posicion definitiva del cuadro.
 
-        // ---------------- Fase 2: satelites (dependientes) ------------------
+        // ------------- Fase 2: cuerpos dependientes (leen a otro) -----------
+        // Satelites (leen a su padre) y la nave (lee a su planeta destino).
+        // Sus objetivos son siempre cuerpos de la fase 1, ya actualizados.
 #ifdef USE_OPENMP
 #pragma omp for schedule(static)
 #endif
-        for (int k = 0; k < numSatelites; ++k) {
-            const int indice = satelites[k];
+        for (int k = 0; k < numDependientes; ++k) {
+            const int indice = dependientes[k];
             CuerpoCeleste& cuerpo = cuerpos[indice];
 
 #ifdef USE_OPENMP
@@ -612,7 +1073,12 @@ static void actualizarEscena(float dt) {
 #endif
             cuerpo.anguloRotacion = normalizarAngulo(
                 cuerpo.anguloRotacion + cuerpo.velocidadRotacion * dt);
-            fisicaSatelite(cuerpo, cuerpos[cuerpo.indicePadre], dt);
+
+            if (cuerpo.tipo == FISICA_NAVE) {
+                fisicaNave(cuerpo, cuerpos, destinos, numDestinos, dt);
+            } else {
+                fisicaSatelite(cuerpo, cuerpos[cuerpo.indicePadre], dt);
+            }
         }
     }
     // Salida de la region paralela: barrera final. El hilo principal ya puede
@@ -702,8 +1168,15 @@ static void inicializarCuerpos(long cantidad, unsigned int semilla) {
     g_escena.cuerpos.clear();
     g_escena.cuerpos.reserve(static_cast<size_t>(cantidad));
     g_escena.indicesPrimarios.clear();
-    g_escena.indicesSatelites.clear();
+    g_escena.indicesDependientes.clear();
+    g_escena.indicesDestinoNave.clear();
+    g_escena.indiceNave = -1;
     g_escena.arenaTransferida = 0.0f;
+    g_escena.estelaNaveX.assign(NAVE_LARGO_ESTELA, 0.0f);
+    g_escena.estelaNaveY.assign(NAVE_LARGO_ESTELA, 0.0f);
+    g_escena.estelaCursor = 0;
+    g_escena.estelaLlenas = 0;
+    g_escena.cuerposSolicitados = cantidad;
     for (int t = 0; t < CANTIDAD_TIPOS_FISICA; ++t) g_escena.conteoPorTipo[t] = 0;
 
     for (long i = 0; i < cantidad; ++i) {
@@ -755,6 +1228,9 @@ static void inicializarCuerpos(long cantidad, unsigned int semilla) {
         cuerpo.tieneAnillo = false;
         cuerpo.inclinacionAnillo = 0.0f;
         cuerpo.cantidadManchas = 0;
+        cuerpo.opacidad = 1.0f;
+        cuerpo.empujadoPorOnda = false;
+        cuerpo.indiceObjetivo = -1;
 
         // --- Parametros especificos de cada modelo de fisica ---
         switch (cuerpo.tipo) {
@@ -884,10 +1360,77 @@ static void inicializarCuerpos(long cantidad, unsigned int semilla) {
         g_escena.cuerpos.push_back(cuerpo);
 
         if (cuerpo.tipo == FISICA_SATELITE) {
-            g_escena.indicesSatelites.push_back(static_cast<int>(i));
+            g_escena.indicesDependientes.push_back(static_cast<int>(i));
         } else {
             g_escena.indicesPrimarios.push_back(static_cast<int>(i));
+            // Los cuerpos de la fase 1 son destinos validos para la nave: al
+            // estar ya actualizados cuando la nave los lee, no hay carrera.
+            g_escena.indicesDestinoNave.push_back(static_cast<int>(i));
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Elementos fijos de la escena, siempre presentes y ajenos al parametro N:
+    // la Sun Station y la nave exploradora. Se anaden al mismo arreglo para que
+    // participen del reparto de trabajo entre hilos como cualquier otro cuerpo.
+    // ------------------------------------------------------------------
+
+    // --- Sun Station: anillo en orbita rasante al Sol ---
+    {
+        CuerpoCeleste estacion;
+        std::memset(&estacion, 0, sizeof(estacion));
+        estacion.tipo = FISICA_ESTACION;
+        estacion.anguloOrbital    = distUnitaria(generador) * 2.0f * PI;
+        estacion.velocidadAngular = 0.85f;   // vuelta completa en ~7 s
+        estacion.radioBase        = 9.0f * (escalaCuerpo > 1.0f ? 1.35f : 1.0f);
+        estacion.radioCuerpo      = estacion.radioBase;
+        estacion.radioAnillo      = estacion.radioBase * 2.1f;
+        estacion.velocidadRotacion = 1.4f;   // el anillo gira sobre si mismo
+        estacion.anguloRotacion   = 0.0f;
+        estacion.colorR = 0.82f; estacion.colorG = 0.80f; estacion.colorB = 0.72f;
+        estacion.manchaR = 0.45f; estacion.manchaG = 0.43f; estacion.manchaB = 0.40f;
+        estacion.indicePadre = -1;
+        estacion.indiceCompanero = -1;
+        estacion.indiceObjetivo = -1;
+        estacion.opacidad = 1.0f;
+        estacion.empujadoPorOnda = false;
+
+        g_escena.conteoPorTipo[FISICA_ESTACION] += 1;
+        g_escena.indicesPrimarios.push_back(
+            static_cast<int>(g_escena.cuerpos.size()));
+        g_escena.cuerpos.push_back(estacion);
+        // Nota: la estacion NO se anade a indicesDestinoNave; enviar la nave a
+        // una orbita rasante al Sol seria un viaje de ida.
+    }
+
+    // --- Nave exploradora ---
+    {
+        CuerpoCeleste nave;
+        std::memset(&nave, 0, sizeof(nave));
+        nave.tipo = FISICA_NAVE;
+        nave.radioBase   = 7.0f * (escalaCuerpo > 1.0f ? 1.4f : 1.0f);
+        nave.radioCuerpo = nave.radioBase;
+        nave.posX = g_escena.centroX + radioOrbitaMaxima * 0.6f;
+        nave.posY = g_escena.centroY;
+        nave.velX = 0.0f;
+        nave.velY = 60.0f;
+        nave.rumbo = PI * 0.5f;
+        nave.indiceObjetivo  = -1;   // elige destino en el primer cuadro
+        nave.tiempoEnDestino = 0.0f;
+        nave.contadorViajes  = 0u;
+        nave.empuje = 0.0f;
+        nave.colorR = 0.90f; nave.colorG = 0.86f; nave.colorB = 0.76f;
+        nave.manchaR = 0.42f; nave.manchaG = 0.32f; nave.manchaB = 0.24f;
+        nave.indicePadre = -1;
+        nave.indiceCompanero = -1;
+        nave.velocidadRotacion = 0.0f;  // no gira: apunta hacia donde vuela
+        nave.opacidad = 1.0f;
+        nave.empujadoPorOnda = false;
+
+        g_escena.conteoPorTipo[FISICA_NAVE] += 1;
+        g_escena.indiceNave = static_cast<int>(g_escena.cuerpos.size());
+        g_escena.indicesDependientes.push_back(g_escena.indiceNave);
+        g_escena.cuerpos.push_back(nave);
     }
 
     // El fondo estelar usa una semilla derivada para que no quede acoplado al
@@ -902,12 +1445,19 @@ static void inicializarCuerpos(long cantidad, unsigned int semilla) {
 // Dibuja un disco relleno mediante un abanico de triangulos.
 static void dibujarDisco(float centroX, float centroY, float radio,
                          float r, float g, float b, float alfa) {
+    // Resolucion adaptativa: un disco pequeno no necesita muchos lados, pero el
+    // Sol hinchado de la supernova ocupa media pantalla y con pocos segmentos se
+    // le notaria la forma de poligono.
+    int segmentos = static_cast<int>(radio * 0.55f);
+    if (segmentos < 12)  segmentos = 12;
+    if (segmentos > 128) segmentos = 128;
+
     glColor4f(r, g, b, alfa);
     glBegin(GL_TRIANGLE_FAN);
     glVertex2f(centroX, centroY); // vertice central del abanico
-    for (int i = 0; i <= SEGMENTOS_CIRCULO; ++i) {
+    for (int i = 0; i <= segmentos; ++i) {
         const float angulo = 2.0f * PI * static_cast<float>(i) /
-                             static_cast<float>(SEGMENTOS_CIRCULO);
+                             static_cast<float>(segmentos);
         glVertex2f(centroX + radio * std::cos(angulo),
                    centroY + radio * std::sin(angulo));
     }
@@ -1104,6 +1654,311 @@ static void dibujarColumnaDeArena(const CuerpoCeleste& donante,
 }
 
 // ---------------------------------------------------------------------------
+// Sun Station: no es un disco, es una estructura. Se dibuja como un anillo
+// visto en escorzo con radios que lo unen a un nucleo central, mas dos modulos
+// en los extremos. El conjunto gira sobre si mismo con anguloRotacion.
+// ---------------------------------------------------------------------------
+static void dibujarEstacionSolar(const CuerpoCeleste& c, float alfa) {
+    const float radioAnillo = c.radioAnillo;
+    const float escorzo = 0.45f;   // achatamiento vertical del anillo
+    const float giro = c.anguloRotacion;
+    const float cosGiro = std::cos(giro);
+    const float senGiro = std::sin(giro);
+
+    // Transforma un punto del plano del anillo a coordenadas de pantalla.
+    // El anillo se ve inclinado, asi que la componente vertical se comprime y
+    // luego todo se rota por el angulo de giro de la estructura.
+    #define ESTACION_PUNTO(ang, radio, sx, sy)                                  \
+        do {                                                                    \
+            const float px_ = (radio) * std::cos(ang);                          \
+            const float py_ = (radio) * std::sin(ang) * escorzo;                \
+            (sx) = c.posX + px_ * cosGiro - py_ * senGiro;                       \
+            (sy) = c.posY + px_ * senGiro + py_ * cosGiro;                       \
+        } while (0)
+
+    // Halo tenue: la estacion esta al rojo por la cercania al Sol.
+    dibujarDisco(c.posX, c.posY, radioAnillo * 1.25f, 1.0f, 0.72f, 0.35f, 0.12f);
+
+    // Anillo exterior (dos trazos concentricos para darle grosor).
+    const int pasos = SEGMENTOS_CIRCULO * 2;
+    for (int capa = 0; capa < 2; ++capa) {
+        const float radio = radioAnillo * (1.0f - 0.14f * capa);
+        glColor4f(c.colorR, c.colorG, c.colorB, alfa * (0.9f - 0.25f * capa));
+        glBegin(GL_LINE_LOOP);
+        for (int i = 0; i < pasos; ++i) {
+            const float ang = 2.0f * PI * static_cast<float>(i) /
+                              static_cast<float>(pasos);
+            float sx, sy;
+            ESTACION_PUNTO(ang, radio, sx, sy);
+            glVertex2f(sx, sy);
+        }
+        glEnd();
+    }
+
+    // Cuatro radios que unen el anillo con el nucleo.
+    glColor4f(c.colorR, c.colorG, c.colorB, alfa * 0.75f);
+    glBegin(GL_LINES);
+    for (int i = 0; i < 4; ++i) {
+        const float ang = PI * 0.5f * static_cast<float>(i);
+        float sx, sy;
+        ESTACION_PUNTO(ang, radioAnillo, sx, sy);
+        glVertex2f(c.posX, c.posY);
+        glVertex2f(sx, sy);
+    }
+    glEnd();
+
+    // Modulos en dos extremos opuestos del anillo.
+    for (int i = 0; i < 2; ++i) {
+        const float ang = PI * static_cast<float>(i);
+        float sx, sy;
+        ESTACION_PUNTO(ang, radioAnillo, sx, sy);
+        dibujarDisco(sx, sy, c.radioCuerpo * 0.42f,
+                     c.manchaR + 0.25f, c.manchaG + 0.22f, c.manchaB + 0.18f,
+                     alfa);
+    }
+
+    // Nucleo central, con una luz de aviso que parpadea.
+    dibujarDisco(c.posX, c.posY, c.radioCuerpo * 0.55f,
+                 c.colorR, c.colorG, c.colorB, alfa);
+    const float baliza = 0.45f + 0.55f * std::fabs(std::sin(giro * 2.0f));
+    dibujarDisco(c.posX, c.posY, c.radioCuerpo * 0.22f,
+                 1.0f, 0.45f, 0.30f, alfa * baliza);
+
+    #undef ESTACION_PUNTO
+}
+
+// ---------------------------------------------------------------------------
+// Nave exploradora: casco triangular alargado, dos alerones, cabina iluminada
+// y llama del motor proporcional al empuje. Todo se orienta segun el rumbo.
+// ---------------------------------------------------------------------------
+static void dibujarNave(const CuerpoCeleste& c, float tiempo, float alfa) {
+    const float largo = c.radioCuerpo * 1.9f;
+    const float ancho = c.radioCuerpo * 0.85f;
+    const float cosR = std::cos(c.rumbo);
+    const float senR = std::sin(c.rumbo);
+
+    // Pasa un punto del sistema local de la nave (x hacia proa) a pantalla.
+    #define NAVE_PUNTO(lx, ly, sx, sy)                     \
+        do {                                                \
+            (sx) = c.posX + (lx) * cosR - (ly) * senR;      \
+            (sy) = c.posY + (lx) * senR + (ly) * cosR;      \
+        } while (0)
+
+    // --- Llama del motor (detras del casco) ---
+    if (c.empuje > 0.02f) {
+        const float parpadeo = 0.72f + 0.28f * std::sin(tiempo * 38.0f);
+        const float largoLlama = largo * (0.85f + 1.5f * c.empuje) * parpadeo;
+        float x1, y1, x2, y2, x3, y3;
+        NAVE_PUNTO(-largo * 0.55f, -ancho * 0.42f, x1, y1);
+        NAVE_PUNTO(-largo * 0.55f,  ancho * 0.42f, x2, y2);
+        NAVE_PUNTO(-largo * 0.55f - largoLlama, 0.0f, x3, y3);
+        glBegin(GL_TRIANGLES);
+        glColor4f(1.0f, 0.78f, 0.35f, alfa * 0.85f);
+        glVertex2f(x1, y1);
+        glVertex2f(x2, y2);
+        glColor4f(1.0f, 0.35f, 0.10f, 0.0f);
+        glVertex2f(x3, y3);
+        glEnd();
+    }
+
+    // --- Alerones ---
+    glColor4f(c.manchaR + 0.10f, c.manchaG + 0.08f, c.manchaB + 0.06f, alfa);
+    glBegin(GL_TRIANGLES);
+    {
+        float ax, ay, bx, by, cx2, cy2;
+        NAVE_PUNTO(-largo * 0.25f, 0.0f, ax, ay);
+        NAVE_PUNTO(-largo * 0.62f, -ancho * 1.15f, bx, by);
+        NAVE_PUNTO(-largo * 0.62f, -ancho * 0.15f, cx2, cy2);
+        glVertex2f(ax, ay); glVertex2f(bx, by); glVertex2f(cx2, cy2);
+
+        NAVE_PUNTO(-largo * 0.25f, 0.0f, ax, ay);
+        NAVE_PUNTO(-largo * 0.62f,  ancho * 1.15f, bx, by);
+        NAVE_PUNTO(-largo * 0.62f,  ancho * 0.15f, cx2, cy2);
+        glVertex2f(ax, ay); glVertex2f(bx, by); glVertex2f(cx2, cy2);
+    }
+    glEnd();
+
+    // --- Casco ---
+    glBegin(GL_TRIANGLES);
+    {
+        float proaX, proaY, popaIzqX, popaIzqY, popaDerX, popaDerY;
+        NAVE_PUNTO(largo, 0.0f, proaX, proaY);
+        NAVE_PUNTO(-largo * 0.55f, -ancho, popaIzqX, popaIzqY);
+        NAVE_PUNTO(-largo * 0.55f,  ancho, popaDerX, popaDerY);
+        glColor4f(c.colorR, c.colorG, c.colorB, alfa);
+        glVertex2f(proaX, proaY);
+        glColor4f(c.colorR * 0.65f, c.colorG * 0.65f, c.colorB * 0.65f, alfa);
+        glVertex2f(popaIzqX, popaIzqY);
+        glVertex2f(popaDerX, popaDerY);
+    }
+    glEnd();
+
+    // --- Cabina ---
+    {
+        float cabinaX, cabinaY;
+        NAVE_PUNTO(largo * 0.30f, 0.0f, cabinaX, cabinaY);
+        dibujarDisco(cabinaX, cabinaY, c.radioCuerpo * 0.32f,
+                     0.55f, 0.85f, 1.0f, alfa);
+    }
+
+    #undef NAVE_PUNTO
+}
+
+// Estela de la nave: las posiciones recientes, desvaneciendose hacia atras.
+static void dibujarEstelaNave(float alfa) {
+    if (g_escena.estelaLlenas < 2) return;
+
+    glBegin(GL_LINE_STRIP);
+    for (size_t k = 0; k < g_escena.estelaLlenas; ++k) {
+        // Se recorre del mas antiguo al mas reciente.
+        const size_t indice = (g_escena.estelaCursor + NAVE_LARGO_ESTELA -
+                               g_escena.estelaLlenas + k) % NAVE_LARGO_ESTELA;
+        const float f = static_cast<float>(k) /
+                        static_cast<float>(g_escena.estelaLlenas);
+        glColor4f(0.65f, 0.82f, 1.0f, alfa * 0.42f * f * f);
+        glVertex2f(g_escena.estelaNaveX[indice], g_escena.estelaNaveY[indice]);
+    }
+    glEnd();
+}
+
+// ---------------------------------------------------------------------------
+// Elementos de la secuencia final.
+// ---------------------------------------------------------------------------
+
+// Asteroide: roca irregular (radio modulado por armonicos) con una estela
+// incandescente que apunta en direccion contraria a su movimiento.
+static void dibujarAsteroide() {
+    const float x = g_escena.asteroideX;
+    const float y = g_escena.asteroideY;
+    const float radio = g_escena.asteroideRadio;
+
+    // Estela de entrada.
+    const float rapidez = std::sqrt(g_escena.asteroideVelX * g_escena.asteroideVelX +
+                                    g_escena.asteroideVelY * g_escena.asteroideVelY);
+    if (rapidez > 1.0f) {
+        const float ux = -g_escena.asteroideVelX / rapidez;
+        const float uy = -g_escena.asteroideVelY / rapidez;
+        const int pasos = 14;
+        for (int k = 1; k <= pasos; ++k) {
+            const float f = static_cast<float>(k) / static_cast<float>(pasos);
+            dibujarDisco(x + ux * radio * 9.0f * f, y + uy * radio * 9.0f * f,
+                         radio * (1.0f - 0.75f * f),
+                         1.0f, 0.55f - 0.35f * f, 0.15f,
+                         0.42f * (1.0f - f));
+        }
+    }
+
+    // Cuerpo irregular.
+    glBegin(GL_TRIANGLE_FAN);
+    glColor4f(0.55f, 0.44f, 0.38f, 1.0f);
+    glVertex2f(x, y);
+    const int vertices = 14;
+    for (int i = 0; i <= vertices; ++i) {
+        const float ang = 2.0f * PI * static_cast<float>(i) /
+                          static_cast<float>(vertices) + g_escena.asteroideGiro;
+        // Radio irregular: dos armonicos le quitan la forma de circulo perfecto.
+        const float irregular = radio * (1.0f + 0.22f * std::sin(3.0f * ang) +
+                                                0.13f * std::sin(7.0f * ang));
+        glColor4f(0.42f, 0.33f, 0.29f, 1.0f);
+        glVertex2f(x + irregular * std::cos(ang), y + irregular * std::sin(ang));
+    }
+    glEnd();
+
+    // Cara caliente, la que mira al Sol.
+    float haciaSolX = g_escena.centroX - x;
+    float haciaSolY = g_escena.centroY - y;
+    const float d = std::sqrt(haciaSolX * haciaSolX + haciaSolY * haciaSolY);
+    if (d > 1.0e-3f) {
+        haciaSolX /= d;
+        haciaSolY /= d;
+        dibujarDisco(x + haciaSolX * radio * 0.35f,
+                     y + haciaSolY * radio * 0.35f,
+                     radio * 0.55f, 1.0f, 0.62f, 0.25f, 0.75f);
+    }
+}
+
+// Cascaron de la supernova: la banda de material incandescente que se expande
+// detras del frente. Se dibuja como un anillo relleno con degradado, brillante
+// por dentro y transparente por fuera; es lo que hace legible la explosion una
+// vez que el nucleo ya colapso.
+static void dibujarCascaronExplosion() {
+    const float radioExterior = g_escena.radioOnda;
+    if (radioExterior <= 2.0f) return;
+
+    const float grosor = 55.0f + radioExterior * 0.40f;
+    float radioInterior = radioExterior - grosor;
+    if (radioInterior < 0.0f) radioInterior = 0.0f;
+
+    float avance = g_escena.tiempoEnEtapa / FINAL_DURACION_ONDA;
+    if (avance > 1.0f) avance = 1.0f;
+    const float alfa = 0.60f * (1.0f - avance) * (1.0f - avance);
+
+    const int segmentos = 96;
+    glBegin(GL_TRIANGLE_STRIP);
+    for (int i = 0; i <= segmentos; ++i) {
+        const float angulo = 2.0f * PI * static_cast<float>(i) /
+                             static_cast<float>(segmentos);
+        const float cosA = std::cos(angulo);
+        const float senA = std::sin(angulo);
+
+        // Borde interior: brillante. Borde exterior: se funde con el fondo.
+        glColor4f(1.0f, 0.86f, 0.55f, alfa);
+        glVertex2f(g_escena.centroX + radioInterior * cosA,
+                   g_escena.centroY + radioInterior * senA);
+        glColor4f(1.0f, 0.42f, 0.10f, 0.0f);
+        glVertex2f(g_escena.centroX + radioExterior * cosA,
+                   g_escena.centroY + radioExterior * senA);
+    }
+    glEnd();
+}
+
+// Onda expansiva: varios frentes concentricos que se persiguen y se apagan.
+static void dibujarOndaExpansiva() {
+    for (int capa = 0; capa < 3; ++capa) {
+        const float radio = g_escena.radioOnda -
+                            static_cast<float>(capa) * 34.0f;
+        if (radio <= 0.0f) continue;
+
+        const float desvanecido = 1.0f -
+            g_escena.tiempoEnEtapa / FINAL_DURACION_ONDA;
+        const float alfa = (desvanecido > 0.0f ? desvanecido : 0.0f) *
+                           (0.85f - 0.22f * static_cast<float>(capa));
+
+        glLineWidth(3.0f - static_cast<float>(capa));
+        dibujarContorno(g_escena.centroX, g_escena.centroY, radio,
+                        1.0f, 0.80f - 0.15f * static_cast<float>(capa), 0.45f,
+                        alfa);
+    }
+    glLineWidth(1.0f);
+}
+
+// Fragmentos incandescentes lanzados por la supernova.
+static void dibujarEscombros() {
+    for (size_t i = 0; i < g_escena.escombros.size(); ++i) {
+        const Escombro& fragmento = g_escena.escombros[i];
+        if (fragmento.vida <= 0.0f) continue;
+        const float f = fragmento.vida / fragmento.vidaTotal;
+        dibujarDisco(fragmento.x, fragmento.y, fragmento.radio * (0.4f + 0.6f * f),
+                     fragmento.r, fragmento.g, fragmento.b, f);
+    }
+}
+
+// Capa de color a pantalla completa: el fogonazo blanco del impacto y el
+// fundido a negro del cierre.
+static void dibujarVelo(float r, float g, float b, float alfa) {
+    if (alfa <= 0.0f) return;
+    if (alfa > 1.0f) alfa = 1.0f;
+    glColor4f(r, g, b, alfa);
+    glBegin(GL_QUADS);
+    glVertex2f(0.0f, 0.0f);
+    glVertex2f(static_cast<float>(g_escena.anchoVentana), 0.0f);
+    glVertex2f(static_cast<float>(g_escena.anchoVentana),
+               static_cast<float>(g_escena.altoVentana));
+    glVertex2f(0.0f, static_cast<float>(g_escena.altoVentana));
+    glEnd();
+}
+
+// ---------------------------------------------------------------------------
 // Fondo estelar. Las estrellas parpadean con una senoidal de frecuencia propia.
 // ---------------------------------------------------------------------------
 static void dibujarEstrellas(float tiempo) {
@@ -1128,7 +1983,8 @@ static void dibujarEstrellas(float tiempo) {
 // Corona del Sol: fulgores que laten con periodos distintos, insinuando ya la
 // inestabilidad que terminara en supernova.
 // ---------------------------------------------------------------------------
-static void dibujarCoronaSolar(float tiempo) {
+static void dibujarCoronaSolar(float tiempo, float alfaGlobal) {
+    if (alfaGlobal <= 0.01f) return;
     const float radio = g_escena.radioSolActual;
     for (int i = 0; i < RAYOS_CORONA; ++i) {
         const float angulo = 2.0f * PI * static_cast<float>(i) /
@@ -1147,7 +2003,7 @@ static void dibujarCoronaSolar(float tiempo) {
         const float otroY = std::sin(angulo - mediaBase);
 
         glBegin(GL_TRIANGLES);
-        glColor4f(1.0f, 0.72f, 0.28f, 0.22f);
+        glColor4f(1.0f, 0.72f, 0.28f, 0.22f * alfaGlobal);
         glVertex2f(g_escena.centroX + radio * ladoX,
                    g_escena.centroY + radio * ladoY);
         glVertex2f(g_escena.centroX + radio * otroX,
@@ -1232,19 +2088,46 @@ static void dibujarColaCometa(const CuerpoCeleste& cuerpo) {
 }
 
 // Dibuja el Sol: corona de fulgores, capas de halo y nucleo brillante.
+// Durante la supernova el nucleo se blanquea y se va disipando, para que el
+// fundido a negro del cierre no caiga sobre un disco amarillo plano.
 static void dibujarSol(float tiempo) {
-    dibujarCoronaSolar(tiempo);
+    float alfaSol   = 1.0f;
+    float blanqueo  = 0.0f;
+
+    if (g_escena.estadoFinal == FINAL_EXPLOSION ||
+        g_escena.estadoFinal == FINAL_APAGADO) {
+        float avance = (g_escena.estadoFinal == FINAL_APAGADO)
+                           ? 1.0f
+                           : g_escena.tiempoEnEtapa / FINAL_DURACION_ONDA;
+        if (avance > 1.0f) avance = 1.0f;
+
+        blanqueo = avance * 1.3f;
+        if (blanqueo > 1.0f) blanqueo = 1.0f;
+
+        // El nucleo se disipa pronto: lo que debe quedar en pantalla es el
+        // cascaron y los escombros, no un disco plano ocupando el centro.
+        const float inicioDisipacion = 0.25f;
+        const float finDisipacion    = 0.70f;
+        if (avance > inicioDisipacion) {
+            alfaSol = 1.0f - (avance - inicioDisipacion) /
+                             (finDisipacion - inicioDisipacion);
+            if (alfaSol < 0.0f) alfaSol = 0.0f;
+        }
+    }
+
+    dibujarCoronaSolar(tiempo, alfaSol);
 
     const int capasHalo = 10;
     for (int capa = capasHalo; capa >= 1; --capa) {
         const float factor = 1.0f + 0.22f * static_cast<float>(capa);
-        const float alfa   = 0.045f;
         dibujarDisco(g_escena.centroX, g_escena.centroY,
                      g_escena.radioSolActual * factor,
-                     1.0f, 0.65f, 0.15f, alfa);
+                     1.0f, 0.65f + 0.30f * blanqueo, 0.15f + 0.75f * blanqueo,
+                     0.045f * alfaSol);
     }
     dibujarDisco(g_escena.centroX, g_escena.centroY, g_escena.radioSolActual,
-                 1.0f, 0.85f, 0.35f, 1.0f);
+                 1.0f, 0.85f + 0.15f * blanqueo, 0.35f + 0.60f * blanqueo,
+                 alfaSol);
 }
 
 // Dibuja una cadena de texto en coordenadas de ventana.
@@ -1262,14 +2145,19 @@ static void alDibujar() {
     glClear(GL_COLOR_BUFFER_BIT);
 
     const float tiempo = g_escena.tiempoAcumulado;
+    const bool enExplosion = (g_escena.estadoFinal == FINAL_EXPLOSION ||
+                              g_escena.estadoFinal == FINAL_APAGADO);
     // Nivel de detalle: con muchos cuerpos el adorno fino ni se distingue y el
-    // renderizado (que es secuencial) se volveria el cuello de botella.
-    const bool detalleFino = g_escena.cuerpos.size() <= LIMITE_DETALLE_FINO;
+    // renderizado (que es secuencial) se volveria el cuello de botella. Durante
+    // la explosion tampoco se dibuja: los cuerpos ya van desintegrandose.
+    const bool detalleFino = (g_escena.cuerpos.size() <= LIMITE_DETALLE_FINO) &&
+                             !enExplosion;
 
     dibujarEstrellas(tiempo);
 
     // Orbitas de referencia (solo si son pocas, para no saturar la pantalla).
-    if (g_escena.cuerpos.size() <= 64) {
+    // Durante la explosion no se dibujan: los cuerpos ya no las siguen.
+    if (g_escena.cuerpos.size() <= 64 && !enExplosion) {
         for (size_t i = 0; i < g_escena.cuerpos.size(); ++i) {
             if (g_escena.cuerpos[i].tipo != FISICA_SATELITE) {
                 dibujarOrbita(g_escena.cuerpos[i]);
@@ -1294,12 +2182,38 @@ static void alDibujar() {
         }
     }
 
+    // Estela de la nave: se muestrea aqui, en el hilo de dibujado, para no
+    // meter un arreglo por cuerpo (con N grande multiplicaria la memoria).
+    if (g_escena.indiceNave >= 0) {
+        const CuerpoCeleste& nave =
+            g_escena.cuerpos[static_cast<size_t>(g_escena.indiceNave)];
+        g_escena.estelaNaveX[g_escena.estelaCursor] = nave.posX;
+        g_escena.estelaNaveY[g_escena.estelaCursor] = nave.posY;
+        g_escena.estelaCursor = (g_escena.estelaCursor + 1) % NAVE_LARGO_ESTELA;
+        if (g_escena.estelaLlenas < NAVE_LARGO_ESTELA) {
+            g_escena.estelaLlenas += 1;
+        }
+        dibujarEstelaNave(nave.opacidad);
+    }
+
     // Los cuerpos celestes, con el adorno propio de su tipo de fisica.
     for (size_t i = 0; i < g_escena.cuerpos.size(); ++i) {
         const CuerpoCeleste& cuerpo = g_escena.cuerpos[i];
+        const float alfa = cuerpo.opacidad;
+        if (alfa <= 0.0f) continue;   // ya se desintegro
+
+        // --- Cuerpos con forma propia: no son discos ---
+        if (cuerpo.tipo == FISICA_ESTACION) {
+            dibujarEstacionSolar(cuerpo, alfa);
+            continue;
+        }
+        if (cuerpo.tipo == FISICA_NAVE) {
+            dibujarNave(cuerpo, tiempo, alfa);
+            continue;
+        }
 
         // --- Adornos que van DETRAS del cuerpo ---
-        if (cuerpo.tipo == FISICA_KEPLERIANA) {
+        if (cuerpo.tipo == FISICA_KEPLERIANA && !enExplosion) {
             dibujarColaCometa(cuerpo);
         }
         if (detalleFino && cuerpo.tipo == FISICA_OSCILANTE) {
@@ -1324,9 +2238,9 @@ static void alDibujar() {
 
         // --- Atmosfera y cuerpo ---
         dibujarDisco(cuerpo.posX, cuerpo.posY, cuerpo.radioCuerpo * 1.42f,
-                     cuerpo.colorR, cuerpo.colorG, cuerpo.colorB, 0.15f);
+                     cuerpo.colorR, cuerpo.colorG, cuerpo.colorB, 0.15f * alfa);
         dibujarDiscoIluminado(cuerpo.posX, cuerpo.posY, cuerpo.radioCuerpo,
-                              cuerpo.colorR, cuerpo.colorG, cuerpo.colorB, 1.0f);
+                              cuerpo.colorR, cuerpo.colorG, cuerpo.colorB, alfa);
 
         // --- Adornos que van ENCIMA del cuerpo ---
         if (detalleFino) {
@@ -1342,23 +2256,55 @@ static void alDibujar() {
 
         if (cuerpo.tipo == FISICA_CUANTICA) {
             dibujarContorno(cuerpo.posX, cuerpo.posY, cuerpo.radioCuerpo * 2.4f,
-                            cuerpo.colorR, cuerpo.colorG, cuerpo.colorB, 0.55f);
+                            cuerpo.colorR, cuerpo.colorG, cuerpo.colorB,
+                            0.55f * alfa);
+        }
+    }
+
+    // ------------------- Secuencia de cierre -------------------
+    if (g_escena.estadoFinal == FINAL_ASTEROIDE) {
+        dibujarAsteroide();
+    } else if (enExplosion) {
+        dibujarCascaronExplosion();
+        dibujarEscombros();
+        dibujarOndaExpansiva();
+        // Fogonazo blanco del impacto y, al final, fundido a negro.
+        dibujarVelo(1.0f, 0.97f, 0.90f, g_escena.destello);
+        if (g_escena.estadoFinal == FINAL_APAGADO) {
+            dibujarVelo(0.0f, 0.0f, 0.0f,
+                        g_escena.tiempoEnEtapa / FINAL_DURACION_APAGADO);
         }
     }
 
     // ---------------------------- HUD ----------------------------------
+    // Se atenua en cuanto arranca la secuencia final: a partir de ahi lo que
+    // interesa ver es la escena, no las metricas.
+    float alfaHud = 1.0f;
+    if (g_escena.estadoFinal == FINAL_ASTEROIDE) {
+        alfaHud = 1.0f - g_escena.tiempoEnEtapa * 0.8f;
+    } else if (g_escena.estadoFinal != FINAL_INACTIVO) {
+        alfaHud = 0.0f;
+    }
+    if (alfaHud < 0.0f) alfaHud = 0.0f;
+
+    if (alfaHud <= 0.01f) {
+        glutSwapBuffers();
+        return;
+    }
+
     const float alto = static_cast<float>(g_escena.altoVentana);
     char linea[192];
 
-    std::snprintf(linea, sizeof(linea), "FPS: %6.2f   |   N = %zu   |   %s",
-                  g_escena.fpsActual, g_escena.cuerpos.size(),
+    std::snprintf(linea, sizeof(linea),
+                  "FPS: %6.2f   |   N = %ld (+estacion +nave)   |   %s",
+                  g_escena.fpsActual, g_escena.cuerposSolicitados,
 #ifdef USE_OPENMP
                   "OpenMP"
 #else
                   "secuencial"
 #endif
                   );
-    dibujarTexto(10.0f, alto - 22.0f, std::string(linea), 0.85f);
+    dibujarTexto(10.0f, alto - 22.0f, std::string(linea), 0.85f * alfaHud);
 
     // Composicion de la escena por modelo de fisica.
     std::string composicion = "fisica: ";
@@ -1369,7 +2315,7 @@ static void alDibujar() {
                       NOMBRES_FISICA[t], g_escena.conteoPorTipo[t]);
         composicion += parte;
     }
-    dibujarTexto(10.0f, alto - 40.0f, composicion, 0.65f);
+    dibujarTexto(10.0f, alto - 40.0f, composicion, 0.65f * alfaHud);
 
     // Con pocos cuerpos se muestra que hilo atendio a cada uno.
     if (g_escena.cuerpos.size() <= 12 && g_escena.cuerpos.size() > 0) {
@@ -1380,7 +2326,7 @@ static void alDibujar() {
                           i, g_escena.cuerpos[i].hiloAsignado);
             asignacion += parte;
         }
-        dibujarTexto(10.0f, alto - 58.0f, asignacion, 0.55f);
+        dibujarTexto(10.0f, alto - 58.0f, asignacion, 0.55f * alfaHud);
     }
 
     glutSwapBuffers();
@@ -1534,12 +2480,19 @@ static void alEstarOcioso() {
     glutPostRedisplay();
 }
 
-// Permite cerrar el screensaver con ESC o con la tecla 'q'.
+// ESC o 'q' no cierran de golpe: disparan la secuencia final (un asteroide cae
+// sobre el Sol, este entra en supernova y la escena se desintegra) y el
+// programa termina al acabar la animacion. Una segunda pulsacion salta la
+// animacion y sale de inmediato, por si el usuario tiene prisa.
 static void alPresionarTecla(unsigned char tecla, int x, int y) {
     (void)x; (void)y; // parametros no usados
     if (tecla == 27 || tecla == 'q' || tecla == 'Q') {
-        std::printf("Cerrando screensaver.\n");
-        std::exit(EXIT_SUCCESS);
+        if (g_escena.estadoFinal == FINAL_INACTIVO) {
+            iniciarSecuenciaFinal();
+        } else {
+            std::printf("Secuencia final omitida. Cerrando screensaver.\n");
+            std::exit(EXIT_SUCCESS);
+        }
     }
 }
 
@@ -1644,15 +2597,17 @@ int main(int argc, char** argv) {
     }
     std::printf("Fase 1 (independientes): %zu cuerpos, schedule(dynamic,1)\n",
                 g_escena.indicesPrimarios.size());
-    std::printf("Fase 2 (satelites):      %zu cuerpos, schedule(static)\n",
-                g_escena.indicesSatelites.size());
+    std::printf("Fase 2 (dependientes):   %zu cuerpos, schedule(static)\n",
+                g_escena.indicesDependientes.size());
 #ifdef USE_OPENMP
     std::printf("Version: PARALELA (OpenMP, hasta %d hilos)\n",
                 g_hilosDisponibles);
 #else
     std::printf("Version: SECUENCIAL (%d hilo)\n", g_hilosDisponibles);
 #endif
-    std::printf("Presione ESC o 'q' sobre la ventana para salir.\n\n");
+    std::printf("Ademas de los N cuerpos: Sun Station + nave exploradora.\n");
+    std::printf("Presione ESC o 'q' sobre la ventana para iniciar la secuencia\n"
+                "final (asteroide -> supernova); una segunda pulsacion la omite.\n\n");
     std::fflush(stdout);
 
     // --- Registro de callbacks y arranque del bucle de eventos ---

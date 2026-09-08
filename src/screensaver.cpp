@@ -2301,7 +2301,7 @@ static void alDibujar() {
 #ifdef USE_OPENMP
                   "OpenMP"
 #else
-                  "secuencial"
+                  "Distribuido"
 #endif
                   );
     dibujarTexto(10.0f, alto - 22.0f, std::string(linea), 0.85f * alfaHud);
@@ -2469,7 +2469,7 @@ static void alEstarOcioso() {
                 cuerposPorHilo[static_cast<size_t>(hilo)] += 1;
             }
         }
-        std::printf("FPS= %.2f  |  reparto por hilo:", g_escena.fpsActual);
+        // std::printf("FPS= %.2f  |  reparto por hilo:", g_escena.fpsActual);
         for (int h = 0; h < g_hilosDisponibles; ++h) {
             std::printf(" h%d=%d", h, cuerposPorHilo[static_cast<size_t>(h)]);
         }
